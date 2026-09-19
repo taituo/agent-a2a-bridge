@@ -20,9 +20,14 @@ service.
 1. **Directional credentials.** Each invocation resolves one bearer from
    `--token-env`. There is no shared global secret in code; Hura-to-Koura
    and Koura-to-Hura use different env vars/Secrets at deploy time.
-2. **Version pinning.** The client sends `A2A-Version: 1.0`, selects only a
-   JSONRPC `supportedInterfaces` entry whose `protocolVersion` is `1.0`, and
-   rejects Agent Cards or responses that declare another protocol version.
+2. **Version pinning and tenant routing.** The client sends
+   `A2A-Version: 1.0`, selects only a JSONRPC `supportedInterfaces` entry
+   whose `protocolVersion` is `1.0`, and rejects Agent Cards or responses that
+   declare another protocol version. The well-known card is always fetched at
+   the URL origin root, so an endpoint path such as `/a2a/v1` cannot redirect
+   discovery. The selected interface's `tenant`, when present, is carried into
+   every `SendMessage`/`GetTask` request via `--tenant` (omitted when absent);
+   it is routing metadata, never a credential.
 3. **Bounded network use.** Every call has a context deadline plus an HTTP
    client timeout; bodies are capped (default 1 MiB) and oversize responses
    fail closed; `wait` uses bounded exponential backoff (200 ms to 2 s) and
@@ -31,11 +36,15 @@ service.
    connection and hide its task ID.
 4. **Strict response checks.** JSON content type required, JSON-RPC
    `2.0` envelope required, and the response `id` must exactly echo the
-   request `id` (missing/null/numeric/mismatched IDs fail closed). Minimum
-   fields are validated (`name`/`version` plus a 1.0 JSONRPC interface on
-   cards; `id`/`contextId`/`status.state` on tasks), and states/roles must use
-   the A2A 1.0 ProtoJSON enums (`TASK_STATE_*`, `ROLE_*`). Unknown fields are
-   preserved for output but never executed.
+   request `id` (missing/null/numeric/mismatched IDs fail closed). Envelopes
+   carrying both `result` and `error`, and bodies carrying trailing JSON after
+   the first value (card or RPC response), are rejected. Minimum fields are
+   validated (`name`/`version` plus a 1.0 JSONRPC interface on cards;
+   `id`/`contextId`/`status.state` on tasks), and states/roles must use the
+   A2A 1.0 ProtoJSON enums (`TASK_STATE_*`, `ROLE_*`). Card validation is a
+   deliberate narrow operational subset and does not assert every field the
+   1.0 schema marks required; unknown fields are preserved for output but
+   never executed.
 5. **No identity spoofing.** Peer identity comes from the URL under test and
    the presented credential outcome, never from a caller-supplied author
    field in a task.

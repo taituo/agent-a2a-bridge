@@ -43,6 +43,11 @@ type Client struct {
 	MaxBodyBytes    int64
 	PollInterval    time.Duration
 	MaxPollInterval time.Duration
+	// Tenant is the routing identifier from the selected Agent Card
+	// AgentInterface. A2A 1.0 requires it in every request message when the
+	// interface declares one; it is omitted when empty. Use
+	// AgentInterface.Tenant to set it.
+	Tenant string
 }
 
 // NewClient returns a Client with sane defaults over the stdlib transport.
@@ -77,24 +82,25 @@ func (c *Client) maxPollInterval() time.Duration {
 	return DefaultMaxPollInterval
 }
 
-// discoveryURL resolves baseURL to the official card path. If baseURL
-// already ends with the card path it is used as-is.
+// discoveryURL resolves baseURL to the official Agent Card well-known URI at
+// the URL origin root. Per A2A 1.0 / RFC 8615 the card always lives at
+// scheme://host[:port]/.well-known/agent-card.json, so any endpoint path such
+// as /a2a/v1 is discarded rather than appended to. An input that is already
+// the card URL resolves to the same URL. Query and fragment components are
+// validated by url.Parse and then dropped, never carried into the result.
 func discoveryURL(baseURL string) (string, error) {
-	trimmed := strings.TrimRight(baseURL, "/")
-	if strings.HasSuffix(trimmed, AgentCardPath) {
-		if _, err := url.ParseRequestURI(trimmed); err != nil {
-			return "", &UsageError{Msg: "invalid discovery url: " + err.Error()}
-		}
-		return trimmed, nil
+	raw := strings.TrimSpace(baseURL)
+	if raw == "" {
+		return "", &UsageError{Msg: "invalid url (want scheme://host[:port])"}
 	}
-	u, err := url.Parse(trimmed)
+	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", &UsageError{Msg: "invalid url (want scheme://host[:port][/prefix])"}
+		return "", &UsageError{Msg: "invalid url (want scheme://host[:port])"}
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", &UsageError{Msg: "invalid url scheme (want http or https)"}
 	}
-	return trimmed + AgentCardPath, nil
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: AgentCardPath}).String(), nil
 }
 
 // newID returns a hex request/message identifier.
@@ -141,6 +147,17 @@ func checkRPCID(sent string, raw json.RawMessage) error {
 	}
 	if got != sent {
 		return &ProtocolError{Msg: fmt.Sprintf("JSON-RPC response id %q does not match request id %q", got, sent)}
+	}
+	return nil
+}
+
+// ensureNoTrailingJSON rejects a body that carries a second JSON value or
+// trailing garbage after the first decoded value. A clean end of input is the
+// only accepted outcome.
+func ensureNoTrailingJSON(dec *json.Decoder) error {
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return &ProtocolError{Msg: "trailing data after JSON value"}
 	}
 	return nil
 }
@@ -231,11 +248,17 @@ func (c *Client) doJSON(ctx context.Context, token string, reqBody rpcRequest) (
 	if err := dec.Decode(&env); err != nil {
 		return nil, nil, &ProtocolError{Msg: "malformed JSON-RPC response: " + err.Error()}
 	}
+	if err := ensureNoTrailingJSON(dec); err != nil {
+		return nil, nil, err
+	}
 	if env.JSONRPC != JSONRPCVersion {
 		return nil, nil, &ProtocolError{Msg: "unsupported jsonrpc version " + env.JSONRPC + " (want 2.0)"}
 	}
 	if err := checkRPCID(reqBody.ID, env.ID); err != nil {
 		return nil, nil, err
+	}
+	if env.Error != nil && len(env.Result) > 0 {
+		return nil, nil, &ProtocolError{Msg: "JSON-RPC response must not contain both result and error"}
 	}
 	if env.Error != nil {
 		msg := strings.TrimSpace(env.Error.Message)
@@ -297,14 +320,23 @@ func (c *Client) Discover(ctx context.Context) (*AgentCard, error) {
 	if err := dec.Decode(&card); err != nil {
 		return nil, &ProtocolError{Msg: "malformed agent card: " + err.Error()}
 	}
+	if err := ensureNoTrailingJSON(dec); err != nil {
+		return nil, err
+	}
 	if err := ValidateCard(&card); err != nil {
 		return nil, err
 	}
 	return &card, nil
 }
 
-// ValidateCard enforces the minimum A2A 1.0 fields needed for a call:
-// name, version, and at least one JSONRPC interface at protocolVersion 1.0.
+// ValidateCard enforces a deliberately narrow operational subset of the A2A
+// 1.0 Agent Card: name, version, and at least one JSONRPC interface at
+// protocolVersion 1.0 with an http/https URL. It intentionally does NOT
+// validate every field the A2A 1.0 schema marks required (for example
+// description, capabilities, defaultInputModes, defaultOutputModes, and
+// skills); this client only needs enough metadata to place a call. Callers
+// that require full card validation must do it separately. Unknown fields are
+// ignored for forward compatibility.
 func ValidateCard(card *AgentCard) error {
 	if card == nil {
 		return &ProtocolError{Msg: "missing agent card"}
@@ -328,6 +360,7 @@ type sendMessageConfiguration struct {
 type sendMessageParams struct {
 	Message       Message                  `json:"message"`
 	Configuration sendMessageConfiguration `json:"configuration"`
+	Tenant        string                   `json:"tenant,omitempty"`
 }
 
 // SendMessage sends an authenticated A2A 1.0 SendMessage request. contextID
@@ -351,6 +384,7 @@ func (c *Client) SendMessage(ctx context.Context, token, text, contextID string)
 	params, err := json.Marshal(sendMessageParams{
 		Message:       msg,
 		Configuration: sendMessageConfiguration{ReturnImmediately: true},
+		Tenant:        c.Tenant,
 	})
 	if err != nil {
 		return nil, &UsageError{Msg: "encode message: " + err.Error()}
@@ -424,7 +458,8 @@ func validateTask(task *Task) error {
 }
 
 type getTaskParams struct {
-	ID string `json:"id"`
+	ID     string `json:"id"`
+	Tenant string `json:"tenant,omitempty"`
 }
 
 // GetTask fetches one task snapshot via GetTask. Raw preserves unknown
@@ -434,7 +469,7 @@ func (c *Client) GetTask(ctx context.Context, token, taskID string) (*Task, json
 	if strings.TrimSpace(taskID) == "" {
 		return nil, nil, &UsageError{Msg: "task id must not be empty"}
 	}
-	params, err := json.Marshal(getTaskParams{ID: taskID})
+	params, err := json.Marshal(getTaskParams{ID: taskID, Tenant: c.Tenant})
 	if err != nil {
 		return nil, nil, &UsageError{Msg: "encode GetTask params: " + err.Error()}
 	}

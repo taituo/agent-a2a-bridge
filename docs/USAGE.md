@@ -13,19 +13,27 @@ go build -o bin/a2actl ./cmd/a2actl
 
 ```sh
 a2actl discover --url URL [--timeout 15s]
-a2actl send --url URL --token-env ENV_NAME --message TEXT [--context ID] [--timeout 30s]
-a2actl wait --url URL --token-env ENV_NAME --task ID [--timeout 60s]
+a2actl send --url URL --token-env ENV_NAME --message TEXT [--context ID] [--tenant T] [--timeout 30s]
+a2actl wait --url URL --token-env ENV_NAME --task ID [--tenant T] [--timeout 60s]
 ```
 
-- `--url` for `discover` is the agent base URL; the client appends
-  `/.well-known/agent-card.json` (a URL already ending in that path is used
-  as-is). For `send`/`wait` it is the JSON-RPC endpoint (the selected
+- `--url` for `discover` may be a base URL or an endpoint URL; the client
+  always fetches the card at the URL **origin root**
+  `scheme://host[:port]/.well-known/agent-card.json`. Paths such as `/a2a/v1`
+  and any query/fragment are discarded rather than appended to. For
+  `send`/`wait` `--url` is the JSON-RPC endpoint (the selected
   `supportedInterfaces[].url` from the Agent Card, e.g. `http://host:9900`
   or `http://host:18789/a2a/v1`).
-- Agent Cards follow A2A 1.0: `discover` requires `name` and `version` plus a
-  `supportedInterfaces` entry with `protocolBinding: "JSONRPC"` and
-  `protocolVersion: "1.0"`, and prints that interface's `url`,
-  `protocolBinding`, and `protocolVersion`.
+- Agent Cards follow A2A 1.0. Validation is a **narrow operational subset**:
+  `discover` requires `name`, `version`, and a `supportedInterfaces` entry
+  with `protocolBinding: "JSONRPC"` and `protocolVersion: "1.0"`, then prints
+  that interface's `url`, `protocolBinding`, `protocolVersion`, and `tenant`.
+  It deliberately does not require the other fields the 1.0 schema marks
+  required (`description`, `capabilities`, `defaultInputModes`,
+  `defaultOutputModes`, `skills`).
+- If the selected interface declares a `tenant`, A2A 1.0 requires it on every
+  request. Pass `--tenant T` to `send`/`wait` (the value printed by
+  `discover`); it is sent in the request `params` and omitted when empty.
 - Bearer tokens come **only** from the named environment variable, e.g.
   `A2A_TOKEN=... a2actl send --token-env A2A_TOKEN ...`. There is no token
   flag and tokens are never printed.
@@ -34,7 +42,9 @@ a2actl wait --url URL --token-env ENV_NAME --task ID [--timeout 60s]
   non-JSON content type are rejected.
 - JSON-RPC 1.0 methods are `SendMessage` and `GetTask`; responses must carry a
   `jsonrpc: "2.0"` envelope and an `id` that exactly echoes the request.
-  Task states and roles use ProtoJSON enum names (`TASK_STATE_*`, `ROLE_*`).
+  An envelope with both `result` and `error`, and any body with trailing JSON
+  after the first value (card or RPC response), are rejected. Task states and
+  roles use ProtoJSON enum names (`TASK_STATE_*`, `ROLE_*`).
 - `send` requests `configuration.returnImmediately: true` so a Task response
   returns a task ID immediately for `wait` to poll.
 - Output is stable indented JSON on stdout; errors go to stderr.

@@ -145,3 +145,48 @@ func TestSendAndWaitExitCodes(t *testing.T) {
 		t.Fatalf("wait output not JSON: %v", err)
 	}
 }
+
+func TestSendWaitTenantFlags(t *testing.T) {
+	const tenant = "cli-tenant"
+	var sendTenant, getTenant string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var req struct {
+			ID     json.RawMessage            `json:"id"`
+			Method string                     `json:"method"`
+			Params map[string]json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		got := ""
+		if raw, ok := req.Params["tenant"]; ok {
+			_ = json.Unmarshal(raw, &got)
+		}
+		switch req.Method {
+		case "SendMessage":
+			sendTenant = got
+			_, _ = w.Write([]byte(rpcEnvelope(req.ID, `{"task":{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING"}}}`)))
+		case "GetTask":
+			getTenant = got
+			_, _ = w.Write([]byte(rpcEnvelope(req.ID, `{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_COMPLETED"}}`)))
+		default:
+			t.Fatalf("unexpected method %q", req.Method)
+		}
+	}))
+	defer srv.Close()
+
+	var out, errBuf bytes.Buffer
+	if code := Run([]string{"send", "--url", srv.URL, "--token-env", "T", "--tenant", tenant, "--message", "hi"}, &out, &errBuf, getenvFor("T", testBearer)); code != ExitOK {
+		t.Fatalf("send want 0, got %d (%s)", code, errBuf.String())
+	}
+	if sendTenant != tenant {
+		t.Fatalf("SendMessage tenant = %q, want %q", sendTenant, tenant)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := Run([]string{"wait", "--url", srv.URL, "--token-env", "T", "--tenant", tenant, "--task", "t1", "--timeout", "5s"}, &out, &errBuf, getenvFor("T", testBearer)); code != ExitOK {
+		t.Fatalf("wait want 0, got %d (%s)", code, errBuf.String())
+	}
+	if getTenant != tenant {
+		t.Fatalf("GetTask tenant = %q, want %q", getTenant, tenant)
+	}
+}

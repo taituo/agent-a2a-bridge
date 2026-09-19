@@ -120,7 +120,7 @@ func emitJSON(stdout io.Writer, v any) error {
 
 func runDiscover(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
-	urlFlag := fs.String("url", "", "agent base URL (card fetched at /.well-known/agent-card.json)")
+	urlFlag := fs.String("url", "", "agent base or endpoint URL (card fetched at origin /.well-known/agent-card.json)")
 	timeoutFlag := fs.String("timeout", "15s", "overall deadline (e.g. 10s, 1m)")
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
@@ -177,6 +177,7 @@ func runSend(args []string, stdout, stderr io.Writer, getenv func(string) string
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	urlFlag := fs.String("url", "", "agent JSON-RPC endpoint (url from agent card)")
 	tokenEnv := fs.String("token-env", "", "environment variable holding the bearer token")
+	tenant := fs.String("tenant", "", "optional tenant from the selected agent card interface")
 	message := fs.String("message", "", "message text to send")
 	contextID := fs.String("context", "", "optional A2A context ID (generated when empty)")
 	timeoutFlag := fs.String("timeout", "30s", "overall deadline (e.g. 30s, 1m)")
@@ -209,6 +210,7 @@ func runSend(args []string, stdout, stderr io.Writer, getenv func(string) string
 	defer cancel()
 
 	client := a2a.NewClient(*urlFlag)
+	client.Tenant = strings.TrimSpace(*tenant)
 	res, err := client.SendMessage(ctx, token, *message, *contextID)
 	// TaskFailedError still carries an emittable payload; print first.
 	if res != nil {
@@ -234,6 +236,7 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
 	urlFlag := fs.String("url", "", "agent JSON-RPC endpoint (url from agent card)")
 	tokenEnv := fs.String("token-env", "", "environment variable holding the bearer token")
+	tenant := fs.String("tenant", "", "optional tenant from the selected agent card interface")
 	taskID := fs.String("task", "", "task ID to poll")
 	timeoutFlag := fs.String("timeout", "60s", "overall deadline (e.g. 60s, 5m)")
 	fs.SetOutput(stderr)
@@ -265,6 +268,7 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	defer cancel()
 
 	client := a2a.NewClient(*urlFlag)
+	client.Tenant = strings.TrimSpace(*tenant)
 	task, raw, err := client.Wait(ctx, token, *taskID)
 	if task != nil && len(raw) > 0 {
 		if werr := emitJSON(stdout, map[string]any{"task": json.RawMessage(raw)}); werr != nil {

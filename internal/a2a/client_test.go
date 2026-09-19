@@ -621,3 +621,214 @@ func TestWireMessageHasNoLegacyKind(t *testing.T) {
 		t.Fatal("text part must not carry kind")
 	}
 }
+
+func TestDiscoveryURLResolvesOriginRoot(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"http://host:9900", "http://host:9900" + AgentCardPath, false},
+		{"http://host:9900/", "http://host:9900" + AgentCardPath, false},
+		{"http://host:18789/a2a/v1", "http://host:18789" + AgentCardPath, false},
+		{"http://host:18789/a2a/v1/", "http://host:18789" + AgentCardPath, false},
+		{"http://host/a2a/v1/.well-known/agent-card.json", "http://host" + AgentCardPath, false},
+		{"http://host/.well-known/agent-card.json", "http://host" + AgentCardPath, false},
+		{"http://host/a2a/v1?x=1#frag", "http://host" + AgentCardPath, false},
+		{"https://host:8443/prefix", "https://host:8443" + AgentCardPath, false},
+		{"::not-a-url", "", true},
+		{"host:9900", "", true},
+		{"ftp://host/a2a", "", true},
+		{"", "", true},
+	}
+	for _, tc := range cases {
+		got, err := discoveryURL(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("discoveryURL(%q) wanted error, got %q", tc.in, got)
+			}
+			var uerr *UsageError
+			if !errors.As(err, &uerr) {
+				t.Fatalf("discoveryURL(%q) want *UsageError, got %T", tc.in, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("discoveryURL(%q): %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("discoveryURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestDiscoverUsesOriginRootForPathEndpoint(t *testing.T) {
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		jsonHandler(w, cardJSON(validInterface))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL + "/a2a/v1?x=1#frag")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.Discover(ctx); err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if gotPath != AgentCardPath {
+		t.Fatalf("want card fetched at %s, got %s", AgentCardPath, gotPath)
+	}
+	if gotQuery != "" {
+		t.Fatalf("query must not be carried into discovery, got %q", gotQuery)
+	}
+}
+
+func TestTenantPropagation(t *testing.T) {
+	const tenant = "tenant-abc"
+	var sendTenant, getTenant string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage            `json:"id"`
+			Method string                     `json:"method"`
+			Params map[string]json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		var gotTenant string
+		if raw, ok := req.Params["tenant"]; ok {
+			_ = json.Unmarshal(raw, &gotTenant)
+		}
+		switch req.Method {
+		case MethodSendMessage:
+			sendTenant = gotTenant
+			jsonHandler(w, rpcEnvelope(req.ID, `{"task":{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING"}}}`))
+		case MethodGetTask:
+			getTenant = gotTenant
+			jsonHandler(w, rpcEnvelope(req.ID, `{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_COMPLETED"}}`))
+		default:
+			t.Fatalf("unexpected method %q", req.Method)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	c.Tenant = tenant
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.SendMessage(ctx, testToken, "hi", ""); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if _, _, err := c.GetTask(ctx, testToken, "t1"); err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if sendTenant != tenant {
+		t.Fatalf("SendMessage tenant = %q, want %q", sendTenant, tenant)
+	}
+	if getTenant != tenant {
+		t.Fatalf("GetTask tenant = %q, want %q", getTenant, tenant)
+	}
+}
+
+func TestTenantOmittedWhenUnset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if strings.Contains(string(req.Params), "tenant") {
+			t.Fatalf("%s params must omit tenant when unset: %s", req.Method, req.Params)
+		}
+		if req.Method == MethodSendMessage {
+			jsonHandler(w, rpcEnvelope(req.ID, `{"task":{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING"}}}`))
+			return
+		}
+		jsonHandler(w, rpcEnvelope(req.ID, `{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_COMPLETED"}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.SendMessage(ctx, testToken, "hi", ""); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if _, _, err := c.GetTask(ctx, testToken, "t1"); err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+}
+
+func TestRPCResultAndErrorRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jsonHandler(w, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"task":{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING"}}},"error":{"code":-32603,"message":"boom"}}`, decodeID(r)))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.SendMessage(ctx, testToken, "hi", "")
+	var perr *ProtocolError
+	if !errors.As(err, &perr) {
+		t.Fatalf("want *ProtocolError, got %T (%v)", err, err)
+	}
+	if !strings.Contains(err.Error(), "both result and error") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTrailingJSONRejected(t *testing.T) {
+	t.Run("rpc response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			jsonHandler(w, rpcEnvelope(decodeID(r), `{"task":{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING"}}}`)+`{"extra":1}`)
+		}))
+		defer srv.Close()
+		c := NewClient(srv.URL)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := c.SendMessage(ctx, testToken, "hi", "")
+		var perr *ProtocolError
+		if !errors.As(err, &perr) {
+			t.Fatalf("want *ProtocolError, got %T (%v)", err, err)
+		}
+	})
+	t.Run("agent card", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			jsonHandler(w, cardJSON(validInterface)+`{"extra":1}`)
+		}))
+		defer srv.Close()
+		c := NewClient(srv.URL)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := c.Discover(ctx)
+		var perr *ProtocolError
+		if !errors.As(err, &perr) {
+			t.Fatalf("want *ProtocolError, got %T (%v)", err, err)
+		}
+	})
+}
+
+// TestValidateCardNarrowSubset pins the intentional scoping decision: this
+// client validates only name, version, and a 1.0 JSONRPC interface, and does
+// not require the other fields the A2A 1.0 schema marks required. If the
+// contract changes, this test must change with it.
+func TestValidateCardNarrowSubset(t *testing.T) {
+	if err := ValidateCard(&AgentCard{
+		Name:                "n",
+		Version:             "1.0.0",
+		SupportedInterfaces: []AgentInterface{{URL: "https://example.invalid/a2a", ProtocolBinding: "JSONRPC", ProtocolVersion: "1.0"}},
+	}); err != nil {
+		t.Fatalf("narrow subset must validate without description/capabilities/skills: %v", err)
+	}
+	if err := ValidateCard(&AgentCard{Version: "1.0.0", SupportedInterfaces: []AgentInterface{{URL: "https://example.invalid/a2a", ProtocolBinding: "JSONRPC", ProtocolVersion: "1.0"}}}); err == nil {
+		t.Fatal("missing name must fail")
+	}
+	if err := ValidateCard(&AgentCard{Name: "n", SupportedInterfaces: []AgentInterface{{URL: "https://example.invalid/a2a", ProtocolBinding: "JSONRPC", ProtocolVersion: "1.0"}}}); err == nil {
+		t.Fatal("missing version must fail")
+	}
+	if err := ValidateCard(&AgentCard{Name: "n", Version: "1.0.0"}); err == nil {
+		t.Fatal("missing interface must fail")
+	}
+}

@@ -257,17 +257,26 @@ func (c *Client) doJSON(ctx context.Context, token string, reqBody rpcRequest) (
 	if err := checkRPCID(reqBody.ID, env.ID); err != nil {
 		return nil, nil, err
 	}
-	if env.Error != nil && len(env.Result) > 0 {
+	hasResult := env.Result != nil
+	hasError := env.Error != nil
+	if hasError && hasResult {
 		return nil, nil, &ProtocolError{Msg: "JSON-RPC response must not contain both result and error"}
 	}
-	if env.Error != nil {
-		msg := strings.TrimSpace(env.Error.Message)
+	if hasError {
+		if bytes.Equal(bytes.TrimSpace(env.Error), []byte("null")) {
+			return nil, nil, &ProtocolError{Msg: "JSON-RPC error member must be an error object"}
+		}
+		var rpcErr rpcError
+		if err := json.Unmarshal(env.Error, &rpcErr); err != nil {
+			return nil, nil, &ProtocolError{Msg: "malformed JSON-RPC error object: " + err.Error()}
+		}
+		msg := strings.TrimSpace(rpcErr.Message)
 		if msg == "" {
 			msg = "unknown JSON-RPC error"
 		}
-		return nil, nil, &ProtocolError{Msg: fmt.Sprintf("peer JSON-RPC error %d: %s", env.Error.Code, msg)}
+		return nil, nil, &ProtocolError{Msg: fmt.Sprintf("peer JSON-RPC error %d: %s", rpcErr.Code, msg)}
 	}
-	if len(env.Result) == 0 {
+	if !hasResult {
 		return nil, nil, &ProtocolError{Msg: "missing result in JSON-RPC response"}
 	}
 	return &env, resp.Header, nil
@@ -329,14 +338,8 @@ func (c *Client) Discover(ctx context.Context) (*AgentCard, error) {
 	return &card, nil
 }
 
-// ValidateCard enforces a deliberately narrow operational subset of the A2A
-// 1.0 Agent Card: name, version, and at least one JSONRPC interface at
-// protocolVersion 1.0 with an http/https URL. It intentionally does NOT
-// validate every field the A2A 1.0 schema marks required (for example
-// description, capabilities, defaultInputModes, defaultOutputModes, and
-// skills); this client only needs enough metadata to place a call. Callers
-// that require full card validation must do it separately. Unknown fields are
-// ignored for forward compatibility.
+// ValidateCard enforces the required A2A 1.0 Agent Card fields plus an
+// operational JSONRPC 1.0 interface. Unknown fields remain forward-compatible.
 func ValidateCard(card *AgentCard) error {
 	if card == nil {
 		return &ProtocolError{Msg: "missing agent card"}
@@ -344,8 +347,28 @@ func ValidateCard(card *AgentCard) error {
 	if strings.TrimSpace(card.Name) == "" {
 		return &ProtocolError{Msg: "agent card missing name"}
 	}
+	if strings.TrimSpace(card.Description) == "" {
+		return &ProtocolError{Msg: "agent card missing description"}
+	}
 	if strings.TrimSpace(card.Version) == "" {
 		return &ProtocolError{Msg: "agent card missing version"}
+	}
+	if card.Capabilities == nil {
+		return &ProtocolError{Msg: "agent card missing capabilities"}
+	}
+	if card.DefaultInputModes == nil {
+		return &ProtocolError{Msg: "agent card missing defaultInputModes"}
+	}
+	if card.DefaultOutputModes == nil {
+		return &ProtocolError{Msg: "agent card missing defaultOutputModes"}
+	}
+	if card.Skills == nil {
+		return &ProtocolError{Msg: "agent card missing skills"}
+	}
+	for i, skill := range card.Skills {
+		if strings.TrimSpace(skill.ID) == "" || strings.TrimSpace(skill.Name) == "" || strings.TrimSpace(skill.Description) == "" || skill.Tags == nil {
+			return &ProtocolError{Msg: fmt.Sprintf("agent card skill %d missing required id/name/description/tags", i)}
+		}
 	}
 	_, err := card.Interface()
 	return err
@@ -417,6 +440,9 @@ func parseSendResult(raw json.RawMessage) (*SendResult, error) {
 		return nil, &ProtocolError{Msg: "SendMessage result must contain exactly one of task or message"}
 	}
 	if hasTask {
+		if err := validateTaskRaw(env.Task); err != nil {
+			return nil, err
+		}
 		var task Task
 		if err := json.Unmarshal(env.Task, &task); err != nil {
 			return nil, &ProtocolError{Msg: "malformed task result: " + err.Error()}
@@ -434,13 +460,70 @@ func parseSendResult(raw json.RawMessage) (*SendResult, error) {
 		return res, nil
 	}
 	var msg Message
+	if err := validateMessageRaw(env.Message, true); err != nil {
+		return nil, err
+	}
 	if err := json.Unmarshal(env.Message, &msg); err != nil {
 		return nil, &ProtocolError{Msg: "malformed message result: " + err.Error()}
 	}
-	if strings.TrimSpace(msg.MessageID) == "" || len(msg.Parts) == 0 {
-		return nil, &ProtocolError{Msg: "message result missing messageId/parts"}
-	}
 	return &SendResult{Kind: "message", Message: &msg, MessageRaw: append(json.RawMessage(nil), env.Message...)}, nil
+}
+
+func validateMessageRaw(raw json.RawMessage, serverOriginated bool) error {
+	var msg struct {
+		Role      string            `json:"role"`
+		MessageID string            `json:"messageId"`
+		ContextID string            `json:"contextId"`
+		Parts     []json.RawMessage `json:"parts"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return &ProtocolError{Msg: "malformed message: " + err.Error()}
+	}
+	if msg.Role != RoleUser && msg.Role != RoleAgent {
+		return &ProtocolError{Msg: "message has missing or invalid role"}
+	}
+	if serverOriginated && msg.Role != RoleAgent {
+		return &ProtocolError{Msg: "server-originated message role must be ROLE_AGENT"}
+	}
+	if serverOriginated && strings.TrimSpace(msg.ContextID) == "" {
+		return &ProtocolError{Msg: "server-originated message missing contextId"}
+	}
+	if strings.TrimSpace(msg.MessageID) == "" || len(msg.Parts) == 0 {
+		return &ProtocolError{Msg: "message missing messageId/parts"}
+	}
+	for i, rawPart := range msg.Parts {
+		var part map[string]json.RawMessage
+		if err := json.Unmarshal(rawPart, &part); err != nil || part == nil {
+			return &ProtocolError{Msg: fmt.Sprintf("message part %d is not an object", i)}
+		}
+		content := 0
+		for _, field := range []string{"text", "raw", "url", "data"} {
+			if _, ok := part[field]; ok {
+				content++
+			}
+		}
+		if content != 1 {
+			return &ProtocolError{Msg: fmt.Sprintf("message part %d must contain exactly one content field", i)}
+		}
+	}
+	return nil
+}
+
+func validateTaskRaw(raw json.RawMessage) error {
+	var task struct {
+		Status struct {
+			Message json.RawMessage `json:"message"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(raw, &task); err != nil {
+		return &ProtocolError{Msg: "malformed task result: " + err.Error()}
+	}
+	if task.Status.Message != nil && !bytes.Equal(bytes.TrimSpace(task.Status.Message), []byte("null")) {
+		if err := validateMessageRaw(task.Status.Message, true); err != nil {
+			return &ProtocolError{Msg: "invalid task status message: " + err.Error()}
+		}
+	}
+	return nil
 }
 
 // validateTask enforces the minimum A2A 1.0 task fields for a call.
@@ -453,6 +536,15 @@ func validateTask(task *Task) error {
 	}
 	if strings.TrimSpace(task.Status.State) == "" {
 		return &ProtocolError{Msg: "task result missing status.state"}
+	}
+	if task.Status.Message != nil {
+		raw, err := json.Marshal(task.Status.Message)
+		if err != nil {
+			return &ProtocolError{Msg: "encode task status message: " + err.Error()}
+		}
+		if err := validateMessageRaw(raw, true); err != nil {
+			return &ProtocolError{Msg: "invalid task status message: " + err.Error()}
+		}
 	}
 	return nil
 }
@@ -483,6 +575,9 @@ func (c *Client) GetTask(ctx context.Context, token, taskID string) (*Task, json
 		return nil, nil, err
 	}
 	var task Task
+	if err := validateTaskRaw(env.Result); err != nil {
+		return nil, nil, err
+	}
 	if err := json.Unmarshal(env.Result, &task); err != nil {
 		return nil, nil, &ProtocolError{Msg: "malformed GetTask result: " + err.Error()}
 	}

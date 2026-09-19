@@ -46,7 +46,7 @@ func decodeID(r *http.Request) json.RawMessage {
 const validInterface = `{"url":"http://example.invalid/a2a/v1","protocolBinding":"JSONRPC","protocolVersion":"1.0"}`
 
 func cardJSON(interfaces string) string {
-	return `{"name":"koura","description":"test agent","version":"1.0.0","supportedInterfaces":[` + interfaces + `]}`
+	return `{"name":"koura","description":"test agent","version":"1.0.0","supportedInterfaces":[` + interfaces + `],"capabilities":{},"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":[{"id":"chat","name":"Chat","description":"Answers messages","tags":["chat"]}]}`
 }
 
 func TestDiscoverSuccess(t *testing.T) {
@@ -810,25 +810,87 @@ func TestTrailingJSONRejected(t *testing.T) {
 	})
 }
 
-// TestValidateCardNarrowSubset pins the intentional scoping decision: this
-// client validates only name, version, and a 1.0 JSONRPC interface, and does
-// not require the other fields the A2A 1.0 schema marks required. If the
-// contract changes, this test must change with it.
-func TestValidateCardNarrowSubset(t *testing.T) {
-	if err := ValidateCard(&AgentCard{
+func TestValidateCardRequiredFields(t *testing.T) {
+	valid := AgentCard{
 		Name:                "n",
+		Description:         "agent",
 		Version:             "1.0.0",
 		SupportedInterfaces: []AgentInterface{{URL: "https://example.invalid/a2a", ProtocolBinding: "JSONRPC", ProtocolVersion: "1.0"}},
-	}); err != nil {
-		t.Fatalf("narrow subset must validate without description/capabilities/skills: %v", err)
+		Capabilities:        &AgentCapabilities{},
+		DefaultInputModes:   []string{"text/plain"},
+		DefaultOutputModes:  []string{"text/plain"},
+		Skills:              []AgentSkill{{ID: "chat", Name: "Chat", Description: "chat", Tags: []string{"chat"}}},
 	}
-	if err := ValidateCard(&AgentCard{Version: "1.0.0", SupportedInterfaces: []AgentInterface{{URL: "https://example.invalid/a2a", ProtocolBinding: "JSONRPC", ProtocolVersion: "1.0"}}}); err == nil {
-		t.Fatal("missing name must fail")
+	if err := ValidateCard(&valid); err != nil {
+		t.Fatalf("valid card rejected: %v", err)
 	}
-	if err := ValidateCard(&AgentCard{Name: "n", SupportedInterfaces: []AgentInterface{{URL: "https://example.invalid/a2a", ProtocolBinding: "JSONRPC", ProtocolVersion: "1.0"}}}); err == nil {
-		t.Fatal("missing version must fail")
+
+	cases := map[string]func(*AgentCard){
+		"name":               func(c *AgentCard) { c.Name = "" },
+		"description":        func(c *AgentCard) { c.Description = "" },
+		"version":            func(c *AgentCard) { c.Version = "" },
+		"interfaces":         func(c *AgentCard) { c.SupportedInterfaces = nil },
+		"capabilities":       func(c *AgentCard) { c.Capabilities = nil },
+		"defaultInputModes":  func(c *AgentCard) { c.DefaultInputModes = nil },
+		"defaultOutputModes": func(c *AgentCard) { c.DefaultOutputModes = nil },
+		"skills":             func(c *AgentCard) { c.Skills = nil },
+		"skill id":           func(c *AgentCard) { c.Skills[0].ID = "" },
+		"skill name":         func(c *AgentCard) { c.Skills[0].Name = "" },
+		"skill description":  func(c *AgentCard) { c.Skills[0].Description = "" },
+		"skill tags":         func(c *AgentCard) { c.Skills[0].Tags = nil },
 	}
-	if err := ValidateCard(&AgentCard{Name: "n", Version: "1.0.0"}); err == nil {
-		t.Fatal("missing interface must fail")
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			card := valid
+			card.Skills = append([]AgentSkill(nil), valid.Skills...)
+			mutate(&card)
+			if err := ValidateCard(&card); err == nil {
+				t.Fatalf("missing %s must fail", name)
+			}
+		})
+	}
+}
+
+func TestMessageResponseValidation(t *testing.T) {
+	cases := map[string]string{
+		"missing role":       `{"messageId":"m1","parts":[{"text":"x"}]}`,
+		"invalid role":       `{"role":"ROLE_UNSPECIFIED","messageId":"m1","parts":[{"text":"x"}]}`,
+		"user response role": `{"role":"ROLE_USER","messageId":"m1","contextId":"c1","parts":[{"text":"x"}]}`,
+		"missing context":    `{"role":"ROLE_AGENT","messageId":"m1","parts":[{"text":"x"}]}`,
+		"empty part":         `{"role":"ROLE_AGENT","messageId":"m1","contextId":"c1","parts":[{}]}`,
+		"multiple contents":  `{"role":"ROLE_AGENT","messageId":"m1","contextId":"c1","parts":[{"text":"x","url":"https://example.invalid"}]}`,
+		"non-object part":    `{"role":"ROLE_AGENT","messageId":"m1","contextId":"c1","parts":["x"]}`,
+	}
+	for name, message := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseSendResult(json.RawMessage(`{"message":` + message + `}`))
+			var perr *ProtocolError
+			if !errors.As(err, &perr) {
+				t.Fatalf("want *ProtocolError, got %T (%v)", err, err)
+			}
+		})
+	}
+}
+
+func TestTaskStatusMessageValidation(t *testing.T) {
+	raw := json.RawMessage(`{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING","message":{"role":"ROLE_AGENT","messageId":"m1","parts":[{}]}}}`)
+	if err := validateTaskRaw(raw); err == nil {
+		t.Fatal("invalid embedded status message must fail")
+	}
+}
+
+func TestRPCExplicitNullErrorWithResultRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jsonHandler(w, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"message":{"role":"ROLE_AGENT","messageId":"m1","parts":[{"text":"ok"}]}},"error":null}`, decodeID(r)))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.SendMessage(ctx, testToken, "hi", "")
+	var perr *ProtocolError
+	if !errors.As(err, &perr) || !strings.Contains(err.Error(), "both result and error") {
+		t.Fatalf("want result/error *ProtocolError, got %T (%v)", err, err)
 	}
 }

@@ -40,7 +40,7 @@ func decodeID(r *http.Request) json.RawMessage {
 func TestDiscoverExitOK(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"name":"hura","version":"0.21.3","supportedInterfaces":[{"url":"http://example.invalid/a2a/v1","protocolBinding":"JSONRPC","protocolVersion":"1.0"}]}`))
+		_, _ = w.Write([]byte(`{"name":"hura","description":"test agent","version":"0.21.3","supportedInterfaces":[{"url":"http://example.invalid/a2a/v1","protocolBinding":"JSONRPC","protocolVersion":"1.0"}],"capabilities":{},"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":[{"id":"chat","name":"Chat","description":"Answers messages","tags":["chat"]}]}`))
 	}))
 	defer srv.Close()
 	var out, errBuf bytes.Buffer

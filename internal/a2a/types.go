@@ -49,10 +49,28 @@ type AgentInterface struct {
 // supportedInterfaces; there is no top-level url or protocolVersion.
 // Unknown fields are ignored on decode (forward-compatible).
 type AgentCard struct {
-	Name                string           `json:"name"`
-	Description         string           `json:"description,omitempty"`
-	Version             string           `json:"version"`
-	SupportedInterfaces []AgentInterface `json:"supportedInterfaces,omitempty"`
+	Name                string             `json:"name"`
+	Description         string             `json:"description"`
+	Version             string             `json:"version"`
+	SupportedInterfaces []AgentInterface   `json:"supportedInterfaces"`
+	Capabilities        *AgentCapabilities `json:"capabilities"`
+	DefaultInputModes   []string           `json:"defaultInputModes"`
+	DefaultOutputModes  []string           `json:"defaultOutputModes"`
+	Skills              []AgentSkill       `json:"skills"`
+}
+
+// AgentCapabilities is intentionally narrow: an empty object is a valid
+// declaration, while a nil pointer lets validation distinguish a missing
+// required capabilities field.
+type AgentCapabilities struct{}
+
+// AgentSkill contains the fields A2A 1.0 marks required. Optional skill
+// fields and unknown extensions remain forward-compatible on decode.
+type AgentSkill struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Tags        []string `json:"tags"`
 }
 
 // Interface selects the first JSONRPC interface that advertises protocol
@@ -165,7 +183,9 @@ type rpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
+	// RawMessage preserves member presence. In particular, an explicit
+	// `error: null` must not collapse into the same state as an absent error.
+	Error json.RawMessage `json:"error,omitempty"`
 }
 
 // rpcError is a JSON-RPC error object.

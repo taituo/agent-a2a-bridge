@@ -20,15 +20,21 @@ service.
 1. **Directional credentials.** Each invocation resolves one bearer from
    `--token-env`. There is no shared global secret in code; Hura-to-Koura
    and Koura-to-Hura use different env vars/Secrets at deploy time.
-2. **Version pinning.** The client sends `A2A-Version: 1.0` and rejects Agent
-   Cards or responses that declare another protocol version.
+2. **Version pinning.** The client sends `A2A-Version: 1.0`, selects only a
+   JSONRPC `supportedInterfaces` entry whose `protocolVersion` is `1.0`, and
+   rejects Agent Cards or responses that declare another protocol version.
 3. **Bounded network use.** Every call has a context deadline plus an HTTP
    client timeout; bodies are capped (default 1 MiB) and oversize responses
    fail closed; `wait` uses bounded exponential backoff (200 ms to 2 s) and
-   stops at the context deadline.
+   stops at the context deadline. `SendMessage` requests
+   `configuration.returnImmediately: true` so a long task cannot pin the
+   connection and hide its task ID.
 4. **Strict response checks.** JSON content type required, JSON-RPC
-   `2.0` envelope required, minimum fields validated (`name`/`url`/`version`
-   on cards; `id`/`contextId`/`status.state` on tasks). Unknown fields are
+   `2.0` envelope required, and the response `id` must exactly echo the
+   request `id` (missing/null/numeric/mismatched IDs fail closed). Minimum
+   fields are validated (`name`/`version` plus a 1.0 JSONRPC interface on
+   cards; `id`/`contextId`/`status.state` on tasks), and states/roles must use
+   the A2A 1.0 ProtoJSON enums (`TASK_STATE_*`, `ROLE_*`). Unknown fields are
    preserved for output but never executed.
 5. **No identity spoofing.** Peer identity comes from the URL under test and
    the presented credential outcome, never from a caller-supplied author

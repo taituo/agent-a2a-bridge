@@ -34,8 +34,9 @@ const (
 )
 
 // Client is an A2A 1.0 JSON-RPC client. BaseURL is the agent endpoint
-// (the `url` from its Agent Card, e.g. http://host:9900 or
-// http://host:18789/a2a/v1). Zero values are filled by NewClient.
+// (the selected interface `url` from its Agent Card, e.g.
+// http://host:9900 or http://host:18789/a2a/v1). Zero values are filled by
+// NewClient.
 type Client struct {
 	BaseURL         string
 	HTTP            *http.Client
@@ -127,6 +128,23 @@ func checkContentType(h http.Header) error {
 	return nil
 }
 
+// checkRPCID verifies the JSON-RPC response id exactly echoes the request id.
+// The client always sends a string id, so a missing, null, numeric, or
+// different id is rejected.
+func checkRPCID(sent string, raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return &ProtocolError{Msg: "JSON-RPC response missing id"}
+	}
+	var got string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		return &ProtocolError{Msg: "JSON-RPC response id is not a string matching the request id"}
+	}
+	if got != sent {
+		return &ProtocolError{Msg: fmt.Sprintf("JSON-RPC response id %q does not match request id %q", got, sent)}
+	}
+	return nil
+}
+
 // readBounded reads at most max+1 bytes so oversize bodies are detectable.
 func readBounded(r io.Reader, max int64) ([]byte, error) {
 	buf, err := io.ReadAll(io.LimitReader(r, max+1))
@@ -154,10 +172,14 @@ func isTimeout(err error) bool {
 }
 
 // doJSON POSTs a JSON-RPC envelope and decodes the response envelope.
-// It enforces version header, content type, body limit, and auth mapping.
+// It enforces version header, content type, body limit, response-ID
+// correlation, and auth mapping.
 func (c *Client) doJSON(ctx context.Context, token string, reqBody rpcRequest) (*rpcResponse, http.Header, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, nil, &AuthError{Msg: "missing bearer token"}
+	}
+	if strings.TrimSpace(reqBody.ID) == "" {
+		reqBody.ID = newID()
 	}
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
@@ -211,6 +233,9 @@ func (c *Client) doJSON(ctx context.Context, token string, reqBody rpcRequest) (
 	}
 	if env.JSONRPC != JSONRPCVersion {
 		return nil, nil, &ProtocolError{Msg: "unsupported jsonrpc version " + env.JSONRPC + " (want 2.0)"}
+	}
+	if err := checkRPCID(reqBody.ID, env.ID); err != nil {
+		return nil, nil, err
 	}
 	if env.Error != nil {
 		msg := strings.TrimSpace(env.Error.Message)
@@ -278,7 +303,8 @@ func (c *Client) Discover(ctx context.Context) (*AgentCard, error) {
 	return &card, nil
 }
 
-// ValidateCard enforces the minimum fields needed for a call.
+// ValidateCard enforces the minimum A2A 1.0 fields needed for a call:
+// name, version, and at least one JSONRPC interface at protocolVersion 1.0.
 func ValidateCard(card *AgentCard) error {
 	if card == nil {
 		return &ProtocolError{Msg: "missing agent card"}
@@ -286,31 +312,27 @@ func ValidateCard(card *AgentCard) error {
 	if strings.TrimSpace(card.Name) == "" {
 		return &ProtocolError{Msg: "agent card missing name"}
 	}
-	if strings.TrimSpace(card.URL) == "" {
-		return &ProtocolError{Msg: "agent card missing url"}
-	}
-	u, err := url.Parse(card.URL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return &ProtocolError{Msg: "agent card has invalid url"}
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return &ProtocolError{Msg: "agent card url scheme must be http or https"}
-	}
 	if strings.TrimSpace(card.Version) == "" {
 		return &ProtocolError{Msg: "agent card missing version"}
 	}
-	if strings.TrimSpace(card.ProtocolVersion) != "" && card.ProtocolVersion != ProtocolVersion {
-		return &ProtocolError{Msg: "unsupported agent card protocolVersion " + card.ProtocolVersion + " (want 1.0)"}
-	}
-	return nil
+	_, err := card.Interface()
+	return err
+}
+
+// sendMessageConfiguration requests a non-blocking SendMessage so the client
+// receives a task ID immediately and can poll with GetTask / wait.
+type sendMessageConfiguration struct {
+	ReturnImmediately bool `json:"returnImmediately"`
 }
 
 type sendMessageParams struct {
-	Message Message `json:"message"`
+	Message       Message                  `json:"message"`
+	Configuration sendMessageConfiguration `json:"configuration"`
 }
 
-// SendMessage sends an authenticated A2A 1.0 message/send request.
-// contextID may be empty (a fresh one is generated for idempotency scoping).
+// SendMessage sends an authenticated A2A 1.0 SendMessage request. contextID
+// may be empty (a fresh one is generated for idempotency scoping). It requests
+// returnImmediately so a Task response carries an ID the caller can poll.
 // A terminal-failure Task is returned alongside a *TaskFailedError so the
 // caller can still emit the task payload.
 func (c *Client) SendMessage(ctx context.Context, token, text, contextID string) (*SendResult, error) {
@@ -321,20 +343,22 @@ func (c *Client) SendMessage(ctx context.Context, token, text, contextID string)
 		contextID = newID()
 	}
 	msg := Message{
-		Kind:      "message",
-		Role:      "user",
+		Role:      RoleUser,
 		MessageID: newID(),
 		ContextID: contextID,
-		Parts:     []TextPart{{Kind: "text", Text: text}},
+		Parts:     []TextPart{{Text: text}},
 	}
-	params, err := json.Marshal(sendMessageParams{Message: msg})
+	params, err := json.Marshal(sendMessageParams{
+		Message:       msg,
+		Configuration: sendMessageConfiguration{ReturnImmediately: true},
+	})
 	if err != nil {
 		return nil, &UsageError{Msg: "encode message: " + err.Error()}
 	}
 	env, _, err := c.doJSON(ctx, token, rpcRequest{
 		JSONRPC: JSONRPCVersion,
 		ID:      newID(),
-		Method:  "message/send",
+		Method:  MethodSendMessage,
 		Params:  params,
 	})
 	if err != nil {
@@ -343,56 +367,67 @@ func (c *Client) SendMessage(ctx context.Context, token, text, contextID string)
 	return parseSendResult(env.Result)
 }
 
-// parseSendResult accepts either {"kind":"task",...} or {"kind":"message",...}.
+// parseSendResult accepts the A2A 1.0 SendMessageResponse wrapper, which must
+// contain exactly one of `task` or `message` (no `kind` discriminator).
 func parseSendResult(raw json.RawMessage) (*SendResult, error) {
-	var probe struct {
-		Kind string `json:"kind"`
+	var env struct {
+		Task    json.RawMessage `json:"task"`
+		Message json.RawMessage `json:"message"`
 	}
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return nil, &ProtocolError{Msg: "malformed message/send result: " + err.Error()}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, &ProtocolError{Msg: "malformed SendMessage result: " + err.Error()}
 	}
-	switch probe.Kind {
-	case "task":
+	hasTask := len(env.Task) > 0 && string(env.Task) != "null"
+	hasMessage := len(env.Message) > 0 && string(env.Message) != "null"
+	if hasTask == hasMessage {
+		return nil, &ProtocolError{Msg: "SendMessage result must contain exactly one of task or message"}
+	}
+	if hasTask {
 		var task Task
-		if err := json.Unmarshal(raw, &task); err != nil {
+		if err := json.Unmarshal(env.Task, &task); err != nil {
 			return nil, &ProtocolError{Msg: "malformed task result: " + err.Error()}
 		}
-		if strings.TrimSpace(task.ID) == "" {
-			return nil, &ProtocolError{Msg: "task result missing id"}
+		if err := validateTask(&task); err != nil {
+			return nil, err
 		}
-		if strings.TrimSpace(task.ContextID) == "" {
-			return nil, &ProtocolError{Msg: "task result missing contextId"}
-		}
-		if strings.TrimSpace(task.Status.State) == "" {
-			return nil, &ProtocolError{Msg: "task result missing status.state"}
-		}
-		res := &SendResult{Kind: "task", Task: &task, TaskRaw: append(json.RawMessage(nil), raw...)}
+		res := &SendResult{Kind: "task", Task: &task, TaskRaw: append(json.RawMessage(nil), env.Task...)}
 		if IsFailure(task.Status.State) {
 			return res, &TaskFailedError{State: task.Status.State, TaskID: task.ID}
 		}
-		if !IsTerminal(task.Status.State) && task.Status.State != StateSubmitted && task.Status.State != StateWorking && task.Status.State != StateInputRequired {
+		if !IsTerminal(task.Status.State) && !IsInterrupted(task.Status.State) {
 			return nil, &ProtocolError{Msg: "unknown task state " + task.Status.State}
 		}
 		return res, nil
-	case "message":
-		var msg Message
-		if err := json.Unmarshal(raw, &msg); err != nil {
-			return nil, &ProtocolError{Msg: "malformed message result: " + err.Error()}
-		}
-		if strings.TrimSpace(msg.MessageID) == "" && len(msg.Parts) == 0 {
-			return nil, &ProtocolError{Msg: "message result missing messageId/parts"}
-		}
-		return &SendResult{Kind: "message", Message: &msg, MessageRaw: append(json.RawMessage(nil), raw...)}, nil
-	default:
-		return nil, &ProtocolError{Msg: "message/send result kind must be task or message"}
 	}
+	var msg Message
+	if err := json.Unmarshal(env.Message, &msg); err != nil {
+		return nil, &ProtocolError{Msg: "malformed message result: " + err.Error()}
+	}
+	if strings.TrimSpace(msg.MessageID) == "" || len(msg.Parts) == 0 {
+		return nil, &ProtocolError{Msg: "message result missing messageId/parts"}
+	}
+	return &SendResult{Kind: "message", Message: &msg, MessageRaw: append(json.RawMessage(nil), env.Message...)}, nil
+}
+
+// validateTask enforces the minimum A2A 1.0 task fields for a call.
+func validateTask(task *Task) error {
+	if strings.TrimSpace(task.ID) == "" {
+		return &ProtocolError{Msg: "task result missing id"}
+	}
+	if strings.TrimSpace(task.ContextID) == "" {
+		return &ProtocolError{Msg: "task result missing contextId"}
+	}
+	if strings.TrimSpace(task.Status.State) == "" {
+		return &ProtocolError{Msg: "task result missing status.state"}
+	}
+	return nil
 }
 
 type getTaskParams struct {
 	ID string `json:"id"`
 }
 
-// GetTask fetches one task snapshot via tasks/get. Raw preserves unknown
+// GetTask fetches one task snapshot via GetTask. Raw preserves unknown
 // fields for stable output; a terminal-failure state also returns
 // *TaskFailedError alongside the task.
 func (c *Client) GetTask(ctx context.Context, token, taskID string) (*Task, json.RawMessage, error) {
@@ -401,12 +436,12 @@ func (c *Client) GetTask(ctx context.Context, token, taskID string) (*Task, json
 	}
 	params, err := json.Marshal(getTaskParams{ID: taskID})
 	if err != nil {
-		return nil, nil, &UsageError{Msg: "encode tasks/get params: " + err.Error()}
+		return nil, nil, &UsageError{Msg: "encode GetTask params: " + err.Error()}
 	}
 	env, _, err := c.doJSON(ctx, token, rpcRequest{
 		JSONRPC: JSONRPCVersion,
 		ID:      newID(),
-		Method:  "tasks/get",
+		Method:  MethodGetTask,
 		Params:  params,
 	})
 	if err != nil {
@@ -414,25 +449,22 @@ func (c *Client) GetTask(ctx context.Context, token, taskID string) (*Task, json
 	}
 	var task Task
 	if err := json.Unmarshal(env.Result, &task); err != nil {
-		return nil, nil, &ProtocolError{Msg: "malformed tasks/get result: " + err.Error()}
+		return nil, nil, &ProtocolError{Msg: "malformed GetTask result: " + err.Error()}
 	}
-	if strings.TrimSpace(task.ID) == "" {
-		return nil, nil, &ProtocolError{Msg: "tasks/get result missing id"}
-	}
-	if strings.TrimSpace(task.Status.State) == "" {
-		return nil, nil, &ProtocolError{Msg: "tasks/get result missing status.state"}
+	if err := validateTask(&task); err != nil {
+		return nil, nil, err
 	}
 	raw := append(json.RawMessage(nil), env.Result...)
 	if IsFailure(task.Status.State) {
 		return &task, raw, &TaskFailedError{State: task.Status.State, TaskID: task.ID}
 	}
-	if !IsTerminal(task.Status.State) && task.Status.State != StateSubmitted && task.Status.State != StateWorking && task.Status.State != StateInputRequired {
+	if !IsTerminal(task.Status.State) && !IsInterrupted(task.Status.State) {
 		return nil, nil, &ProtocolError{Msg: "unknown task state " + task.Status.State}
 	}
 	return &task, raw, nil
 }
 
-// Wait polls tasks/get with bounded backoff until a terminal state or the
+// Wait polls GetTask with bounded backoff until a terminal state or the
 // context deadline. It returns the final task and its raw payload; terminal
 // failure states return *TaskFailedError alongside the task.
 func (c *Client) Wait(ctx context.Context, token, taskID string) (*Task, json.RawMessage, error) {

@@ -1,44 +1,105 @@
 package a2a
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"net/url"
+	"strings"
+)
 
 // ProtocolVersion is the only A2A protocol version this slice supports.
 const ProtocolVersion = "1.0"
 
-// Terminal task states per TASK.md: wait stops on these.
+// A2A 1.0 TaskState enum values (ProtoJSON SCREAMING_SNAKE names). Per
+// spec section 4.1.3 these are the only states a conformant peer emits.
 const (
-	StateSubmitted     = "submitted"
-	StateWorking       = "working"
-	StateInputRequired = "input-required"
-	StateCompleted     = "completed"
-	StateFailed        = "failed"
-	StateRejected      = "rejected"
-	StateCanceled      = "canceled"
+	StateUnspecified   = "TASK_STATE_UNSPECIFIED"
+	StateSubmitted     = "TASK_STATE_SUBMITTED"
+	StateWorking       = "TASK_STATE_WORKING"
+	StateInputRequired = "TASK_STATE_INPUT_REQUIRED"
+	StateAuthRequired  = "TASK_STATE_AUTH_REQUIRED"
+	StateCompleted     = "TASK_STATE_COMPLETED"
+	StateFailed        = "TASK_STATE_FAILED"
+	StateRejected      = "TASK_STATE_REJECTED"
+	StateCanceled      = "TASK_STATE_CANCELED"
 )
 
-// AgentCard is the narrow validated subset of /.well-known/agent-card.json.
-// Unknown fields are ignored on decode (forward-compatible); discover output
-// re-emits only the validated fields below.
-type AgentCard struct {
-	Name            string `json:"name"`
-	Description     string `json:"description,omitempty"`
+// A2A 1.0 Role enum values (ProtoJSON SCREAMING_SNAKE names).
+const (
+	RoleUser  = "ROLE_USER"
+	RoleAgent = "ROLE_AGENT"
+)
+
+// JSON-RPC method names are PascalCase per A2A 1.0 spec section 9.1.
+const (
+	MethodSendMessage = "SendMessage"
+	MethodGetTask     = "GetTask"
+)
+
+// AgentInterface is one entry of an A2A 1.0 Agent Card's supportedInterfaces
+// array. Clients select the first JSONRPC entry they support.
+type AgentInterface struct {
 	URL             string `json:"url"`
-	Version         string `json:"version"`
-	ProtocolVersion string `json:"protocolVersion,omitempty"`
+	ProtocolBinding string `json:"protocolBinding"`
+	ProtocolVersion string `json:"protocolVersion"`
+	Tenant          string `json:"tenant,omitempty"`
 }
 
-// TextPart is the only part kind this slice produces.
+// AgentCard is the narrow validated subset of /.well-known/agent-card.json.
+// A2A 1.0 relocates the endpoint URL and protocol version into
+// supportedInterfaces; there is no top-level url or protocolVersion.
+// Unknown fields are ignored on decode (forward-compatible).
+type AgentCard struct {
+	Name                string           `json:"name"`
+	Description         string           `json:"description,omitempty"`
+	Version             string           `json:"version"`
+	SupportedInterfaces []AgentInterface `json:"supportedInterfaces,omitempty"`
+}
+
+// Interface selects the first JSONRPC interface that advertises protocol
+// version 1.0. It only inspects fields the slice needs; unknown fields and
+// other bindings are ignored.
+func (c *AgentCard) Interface() (*AgentInterface, error) {
+	if c == nil {
+		return nil, &ProtocolError{Msg: "missing agent card"}
+	}
+	var sawJSONRPC bool
+	for i := range c.SupportedInterfaces {
+		it := &c.SupportedInterfaces[i]
+		if !strings.EqualFold(strings.TrimSpace(it.ProtocolBinding), "jsonrpc") {
+			continue
+		}
+		sawJSONRPC = true
+		if strings.TrimSpace(it.ProtocolVersion) != ProtocolVersion {
+			continue
+		}
+		u, err := url.Parse(strings.TrimSpace(it.URL))
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return nil, &ProtocolError{Msg: "agent card has invalid JSONRPC interface url"}
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return nil, &ProtocolError{Msg: "agent card JSONRPC interface url scheme must be http or https"}
+		}
+		return it, nil
+	}
+	if !sawJSONRPC {
+		return nil, &ProtocolError{Msg: "agent card has no JSONRPC interface"}
+	}
+	return nil, &ProtocolError{Msg: "agent card has no JSONRPC interface for protocolVersion " + ProtocolVersion}
+}
+
+// TextPart is the only part kind this slice produces. A2A 1.0 removed the
+// `kind` discriminator; the member name (`text`) identifies the type.
 type TextPart struct {
-	Kind string `json:"kind"`
 	Text string `json:"text"`
 }
 
-// Message is the narrow A2A message subset used by send/wait.
+// Message is the narrow A2A 1.0 message subset used by send/wait.
+// A2A 1.0 removed the `kind` discriminator and uses ROLE_* enum values.
 type Message struct {
-	Kind      string     `json:"kind,omitempty"`
 	Role      string     `json:"role"`
 	MessageID string     `json:"messageId"`
 	ContextID string     `json:"contextId,omitempty"`
+	TaskID    string     `json:"taskId,omitempty"`
 	Parts     []TextPart `json:"parts"`
 }
 
@@ -48,10 +109,10 @@ type TaskStatus struct {
 	Message *Message `json:"message,omitempty"`
 }
 
-// Task is the narrow task subset. Unknown fields are ignored on decode;
-// callers that need stable passthrough should keep the accompanying Raw.
+// Task is the narrow A2A 1.0 task subset. A2A 1.0 removed the `kind`
+// discriminator. Unknown fields are ignored on decode; callers that need
+// stable passthrough should keep the accompanying Raw.
 type Task struct {
-	Kind      string     `json:"kind,omitempty"`
 	ID        string     `json:"id"`
 	ContextID string     `json:"contextId"`
 	Status    TaskStatus `json:"status"`
@@ -61,6 +122,17 @@ type Task struct {
 func IsTerminal(state string) bool {
 	switch state {
 	case StateCompleted, StateFailed, StateRejected, StateCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsInterrupted reports whether state is a recognized non-terminal state the
+// slice can surface (submitted/working/input-required/auth-required).
+func IsInterrupted(state string) bool {
+	switch state {
+	case StateSubmitted, StateWorking, StateInputRequired, StateAuthRequired:
 		return true
 	default:
 		return false
@@ -78,7 +150,8 @@ func IsFailure(state string) bool {
 	}
 }
 
-// rpcRequest is the JSON-RPC 2.0 envelope this client sends.
+// rpcRequest is the JSON-RPC 2.0 envelope this client sends. The ID is a
+// string so responses can be correlated exactly.
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      string          `json:"id"`
@@ -86,7 +159,8 @@ type rpcRequest struct {
 	Params  json.RawMessage `json:"params"`
 }
 
-// rpcResponse is the JSON-RPC 2.0 envelope this client accepts.
+// rpcResponse is the JSON-RPC 2.0 envelope this client accepts. ID must
+// exactly echo the request ID (checked by doJSON).
 type rpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`

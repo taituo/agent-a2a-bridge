@@ -147,19 +147,24 @@ func runDiscover(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "discover:", err.Error())
 		return exitCode(err)
 	}
+	iface, err := card.Interface()
+	if err != nil {
+		fmt.Fprintln(stderr, "discover:", err.Error())
+		return exitCode(err)
+	}
 	out := map[string]string{
-		"name":     card.Name,
-		"url":      card.URL,
-		"version":  card.Version,
-		"protocol": a2a.ProtocolVersion,
+		"name":            card.Name,
+		"url":             iface.URL,
+		"version":         card.Version,
+		"protocol":        a2a.ProtocolVersion,
+		"protocolBinding": iface.ProtocolBinding,
+		"protocolVersion": iface.ProtocolVersion,
 	}
 	if card.Description != "" {
 		out["description"] = card.Description
 	}
-	if card.ProtocolVersion != "" {
-		out["protocolVersion"] = card.ProtocolVersion
-	} else {
-		out["protocolVersion"] = a2a.ProtocolVersion
+	if iface.Tenant != "" {
+		out["tenant"] = iface.Tenant
 	}
 	if err := emitJSON(stdout, out); err != nil {
 		fmt.Fprintln(stderr, "discover:", err.Error())

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,10 +22,25 @@ func getenvFor(env, val string) func(string) string {
 	}
 }
 
+func rpcEnvelope(id json.RawMessage, result string) string {
+	if len(id) == 0 {
+		id = json.RawMessage(`"1"`)
+	}
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":%s}`, id, result)
+}
+
+func decodeID(r *http.Request) json.RawMessage {
+	var req struct {
+		ID json.RawMessage `json:"id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	return req.ID
+}
+
 func TestDiscoverExitOK(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"name":"hura","url":"http://example.invalid/","version":"0.21.3","protocolVersion":"1.0"}`))
+		_, _ = w.Write([]byte(`{"name":"hura","version":"0.21.3","supportedInterfaces":[{"url":"http://example.invalid/a2a/v1","protocolBinding":"JSONRPC","protocolVersion":"1.0"}]}`))
 	}))
 	defer srv.Close()
 	var out, errBuf bytes.Buffer
@@ -36,7 +52,7 @@ func TestDiscoverExitOK(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
 		t.Fatalf("output not JSON: %v", err)
 	}
-	if decoded["name"] != "hura" {
+	if decoded["name"] != "hura" || decoded["url"] != "http://example.invalid/a2a/v1" || decoded["protocolVersion"] != "1.0" {
 		t.Fatalf("unexpected output: %s", out.String())
 	}
 }
@@ -44,7 +60,7 @@ func TestDiscoverExitOK(t *testing.T) {
 func TestTokenEnvRequiredAndNeverPrinted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"kind":"message","role":"agent","messageId":"m1","parts":[{"kind":"text","text":"ok"}]}}`))
+		_, _ = w.Write([]byte(rpcEnvelope(decodeID(r), `{"message":{"role":"ROLE_AGENT","messageId":"m1","parts":[{"text":"ok"}]}}`)))
 	}))
 	defer srv.Close()
 
@@ -71,23 +87,39 @@ func TestTokenEnvRequiredAndNeverPrinted(t *testing.T) {
 	}
 }
 
+func TestProtocolErrorMapsToExit3(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","error":{"code":-32601,"message":"Method not found"}}`))
+	}))
+	defer srv.Close()
+	var out, errBuf bytes.Buffer
+	code := Run([]string{"send", "--url", srv.URL, "--token-env", "T", "--message", "hi"}, &out, &errBuf, getenvFor("T", testBearer))
+	if code != ExitProtocol {
+		t.Fatalf("want %d, got %d (%s)", ExitProtocol, code, errBuf.String())
+	}
+}
+
 func TestSendAndWaitExitCodes(t *testing.T) {
 	var polls int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		var req struct {
-			Method string `json:"method"`
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch req.Method {
-		case "message/send":
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"kind":"task","id":"t1","contextId":"c1","status":{"state":"working"}}}`))
-		case "tasks/get":
+		case "SendMessage":
+			_, _ = w.Write([]byte(rpcEnvelope(req.ID, `{"task":{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING"}}}`)))
+		case "GetTask":
 			if atomic.AddInt64(&polls, 1) == 1 {
-				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"kind":"task","id":"t1","contextId":"c1","status":{"state":"working"}}}`))
+				_, _ = w.Write([]byte(rpcEnvelope(req.ID, `{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_WORKING"}}`)))
 			} else {
-				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"kind":"task","id":"t1","contextId":"c1","status":{"state":"rejected"}}}`))
+				_, _ = w.Write([]byte(rpcEnvelope(req.ID, `{"id":"t1","contextId":"c1","status":{"state":"TASK_STATE_REJECTED"}}`)))
 			}
+		default:
+			t.Fatalf("unexpected method %q", req.Method)
 		}
 	}))
 	defer srv.Close()

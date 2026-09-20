@@ -59,11 +59,19 @@ conversation ID. Add `--store PATH --conversation ID` to `wait` to record its
 terminal state.
 
 The schema separates conversations, immutable messages, and immutable audit
-events. There are intentionally no update or delete commands. Duplicate IDs
-fail instead of overwriting prior history. Common credential shapes are
-redacted before persistence, but callers must still avoid placing secrets in
-prompts. SQLite is an initial local implementation behind a Store interface;
-it can later be replaced by PostgreSQL without changing A2A routing.
+events. The Go interface and CLI intentionally expose no update or delete
+operation; this is an API guarantee rather than protection against a process
+that can directly rewrite the SQLite file. Conversation creation is
+idempotent, while duplicate message and event IDs fail instead of overwriting
+prior history. New database files are forced to mode `0600`, and query commands
+refuse to create a missing store. Common credential shapes are redacted before
+persistence, but callers must still avoid placing secrets in prompts. SQLite
+is an initial local implementation behind a Store interface; it can later be
+replaced by PostgreSQL without changing A2A routing.
+
+The transcript stores text parts. The CLI still prints the peer's complete raw
+A2A object, so non-text parts remain available to a higher-level artifact
+store, but this first SQLite slice does not persist binary/raw/url/data parts.
 
 Examples (synthetic values only):
 

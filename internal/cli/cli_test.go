@@ -24,9 +24,20 @@ func getenvFor(env, val string) func(string) string {
 }
 
 func TestSendPersistsQueryableConversation(t *testing.T) {
+	var wireMessageID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Message struct {
+					MessageID string `json:"messageId"`
+				} `json:"message"`
+			} `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		wireMessageID = request.Params.Message.MessageID
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(rpcEnvelope(decodeID(r), `{"message":{"role":"ROLE_AGENT","messageId":"reply-1","contextId":"conversation-1","parts":[{"text":"token=server-secret must be hidden"}]}}`)))
+		_, _ = w.Write([]byte(rpcEnvelope(request.ID, `{"message":{"role":"ROLE_AGENT","messageId":"reply-1","contextId":"conversation-1","parts":[{"text":"token=server-secret must be hidden"}]}}`)))
 	}))
 	defer srv.Close()
 	db := filepath.Join(t.TempDir(), "conversations.db")
@@ -48,8 +59,40 @@ func TestSendPersistsQueryableConversation(t *testing.T) {
 	if len(messages) != 2 {
 		t.Fatalf("got %d messages: %s", len(messages), out.String())
 	}
+	if got, _ := messages[0]["id"].(string); got == "" || got != wireMessageID {
+		t.Fatalf("stored message id %q != wire id %q", got, wireMessageID)
+	}
 	if strings.Contains(out.String(), "server-secret") || !strings.Contains(out.String(), "[REDACTED]") {
 		t.Fatalf("stored response not redacted: %s", out.String())
+	}
+}
+
+func TestWaitPersistsFinalMessageAndRequiresFlagPair(t *testing.T) {
+	var calls int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		id := decodeID(r)
+		_, _ = w.Write([]byte(rpcEnvelope(id, `{"id":"task-1","contextId":"conversation-1","status":{"state":"TASK_STATE_COMPLETED","message":{"role":"ROLE_AGENT","messageId":"final-1","contextId":"conversation-1","taskId":"task-1","parts":[{"text":"finished"}]}}}`)))
+	}))
+	defer srv.Close()
+	db := filepath.Join(t.TempDir(), "wait.db")
+	var out, errBuf bytes.Buffer
+	code := Run([]string{"wait", "--url", srv.URL, "--token-env", "T", "--task", "task-1", "--store", db}, &out, &errBuf, getenvFor("T", testBearer))
+	if code != ExitUsage || atomic.LoadInt64(&calls) != 0 {
+		t.Fatalf("half-configured persistence: code=%d calls=%d", code, calls)
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = Run([]string{"wait", "--url", srv.URL, "--token-env", "T", "--task", "task-1", "--store", db, "--conversation", "conversation-1", "--sender", "tuomas", "--recipient", "hura"}, &out, &errBuf, getenvFor("T", testBearer))
+	if code != ExitOK {
+		t.Fatalf("wait got %d: %s", code, errBuf.String())
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = Run([]string{"messages", "--store", db, "--conversation", "conversation-1"}, &out, &errBuf, nil)
+	if code != ExitOK || !strings.Contains(out.String(), "finished") || !strings.Contains(out.String(), "final-1") {
+		t.Fatalf("final message missing: code=%d out=%s err=%s", code, out.String(), errBuf.String())
 	}
 }
 

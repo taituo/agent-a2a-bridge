@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,6 +23,9 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("sqlite path is required")
 	}
+	if err := secureCreate(path); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -29,6 +34,10 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	s := &SQLiteStore{db: db}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout=5000"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("configure sqlite: %w", err)
+	}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -36,11 +45,50 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	return s, nil
 }
 
+// OpenSQLiteReadOnly opens an existing store without creating or migrating it.
+func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("sqlite path is required")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("open existing sqlite: %w", err)
+	}
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite read-only: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open sqlite read-only: %w", err)
+	}
+	return &SQLiteStore{db: db}, nil
+}
+
+func secureCreate(path string) error {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("create sqlite: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close sqlite: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure sqlite: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) migrate(ctx context.Context) error {
 	const schema = `
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL DEFAULT '',
@@ -105,6 +153,49 @@ func (s *SQLiteStore) EnsureConversation(ctx context.Context, c Conversation) er
 	return nil
 }
 
+// Record atomically appends a related group of transcript and audit rows.
+func (s *SQLiteStore) Record(ctx context.Context, c Conversation, messages []Message, events []Event) error {
+	if strings.TrimSpace(c.ID) == "" {
+		return errors.New("conversation id is required")
+	}
+	participants, err := json.Marshal(c.Participants)
+	if err != nil {
+		return fmt.Errorf("encode participants: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin record: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO conversations (id,title,participants_json,project_id,created_at) VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING`, c.ID, Redact(c.Title), string(participants), c.ProjectID, timestamp(c.CreatedAt)); err != nil {
+		return fmt.Errorf("record conversation: %w", err)
+	}
+	for _, m := range messages {
+		if strings.TrimSpace(m.ID) == "" || m.ConversationID != c.ID {
+			return errors.New("message id required and conversation id must match batch")
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO messages (id,conversation_id,parent_id,sender,recipient,body,source,context_id,task_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, m.ID, m.ConversationID, m.ParentID, m.Sender, m.Recipient, Redact(m.Body), m.Source, m.ContextID, m.TaskID, timestamp(m.CreatedAt)); err != nil {
+			return fmt.Errorf("record message: %w", err)
+		}
+	}
+	for _, e := range events {
+		if strings.TrimSpace(e.ID) == "" || strings.TrimSpace(e.Type) == "" || e.ConversationID != c.ID {
+			return errors.New("event id/type required and conversation id must match batch")
+		}
+		payload := RedactJSON(e.Payload)
+		if len(e.Payload) == 0 {
+			payload = json.RawMessage(`{}`)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO events (id,conversation_id,type,causation_id,correlation_id,payload_json,created_at) VALUES(?,?,?,?,?,?,?)`, e.ID, e.ConversationID, e.Type, e.CausationID, e.CorrelationID, string(payload), timestamp(e.CreatedAt)); err != nil {
+			return fmt.Errorf("record event: %w", err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit record: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) AppendMessage(ctx context.Context, m Message) error {
 	if strings.TrimSpace(m.ID) == "" || strings.TrimSpace(m.ConversationID) == "" {
 		return errors.New("message id and conversation id are required")
@@ -122,16 +213,13 @@ func (s *SQLiteStore) AppendEvent(ctx context.Context, e Event) error {
 	if strings.TrimSpace(e.ID) == "" || strings.TrimSpace(e.ConversationID) == "" || strings.TrimSpace(e.Type) == "" {
 		return errors.New("event id, conversation id, and type are required")
 	}
-	payload := Redact(string(e.Payload))
-	if strings.TrimSpace(payload) == "" {
-		payload = "{}"
-	}
-	if !json.Valid([]byte(payload)) {
-		payload = `{"redacted":"invalid payload"}`
+	payload := RedactJSON(e.Payload)
+	if len(e.Payload) == 0 {
+		payload = json.RawMessage(`{}`)
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO events
  (id,conversation_id,type,causation_id,correlation_id,payload_json,created_at)
- VALUES(?,?,?,?,?,?,?)`, e.ID, e.ConversationID, e.Type, e.CausationID, e.CorrelationID, payload, timestamp(e.CreatedAt))
+	 VALUES(?,?,?,?,?,?,?)`, e.ID, e.ConversationID, e.Type, e.CausationID, e.CorrelationID, string(payload), timestamp(e.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("append event: %w", err)
 	}

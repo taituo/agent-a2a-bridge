@@ -43,6 +43,9 @@ type Event struct {
 // Store is append-only for transcript and audit data. Implementations expose
 // reads but deliberately no update or delete operation.
 type Store interface {
+	// Record atomically ensures the conversation and appends all supplied
+	// messages and events. It never updates or deletes existing rows.
+	Record(context.Context, Conversation, []Message, []Event) error
 	EnsureConversation(context.Context, Conversation) error
 	AppendMessage(context.Context, Message) error
 	AppendEvent(context.Context, Event) error

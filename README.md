@@ -126,6 +126,8 @@ See [`docs/USAGE.md`](docs/USAGE.md) for complete CLI behavior.
 - Polling backoff designed not to trip common peer rate limits.
 - Bearer values are accepted only through named environment variables.
 - Transcript rows and audit events are append-only through the public API.
+- New local transcript databases use owner-only (`0600`) permissions, and
+  read commands never create a missing database.
 - Common bearer, token, API-key, password and Telegram-token shapes are
   redacted before persistence.
 - Tests use synthetic credentials and local `httptest` servers only.

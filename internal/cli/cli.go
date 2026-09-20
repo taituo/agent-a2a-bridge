@@ -235,15 +235,11 @@ func runSend(args []string, stdout, stderr io.Writer, getenv func(string) string
 		defer store.Close()
 		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer storeCancel()
-		if err := store.EnsureConversation(storeCtx, conversation.Conversation{ID: *contextID, Participants: []string{*sender, *recipient}}); err != nil {
-			fmt.Fprintln(stderr, "send: store:", err)
-			return ExitStore
-		}
-		if err := store.AppendMessage(storeCtx, conversation.Message{ID: requestMessageID, ConversationID: *contextID, Sender: *sender, Recipient: *recipient, Body: *message, Source: *source, ContextID: *contextID}); err != nil {
-			fmt.Fprintln(stderr, "send: store:", err)
-			return ExitStore
-		}
-		if err := store.AppendEvent(storeCtx, conversation.Event{ID: a2a.NewID(), ConversationID: *contextID, Type: "send_started", CausationID: requestMessageID, CorrelationID: *contextID}); err != nil {
+		if err := store.Record(storeCtx,
+			conversation.Conversation{ID: *contextID, Participants: []string{*sender, *recipient}},
+			[]conversation.Message{{ID: requestMessageID, ConversationID: *contextID, Sender: *sender, Recipient: *recipient, Body: *message, Source: *source, ContextID: *contextID}},
+			[]conversation.Event{{ID: a2a.NewID(), ConversationID: *contextID, Type: "send_started", CausationID: requestMessageID, CorrelationID: *contextID}},
+		); err != nil {
 			fmt.Fprintln(stderr, "send: store:", err)
 			return ExitStore
 		}
@@ -251,16 +247,14 @@ func runSend(args []string, stdout, stderr io.Writer, getenv func(string) string
 
 	client := a2a.NewClient(*urlFlag)
 	client.Tenant = strings.TrimSpace(*tenant)
-	res, err := client.SendMessage(ctx, token, *message, *contextID)
+	res, err := client.SendMessageWithID(ctx, token, *message, *contextID, requestMessageID)
+	var storeErr error
 	if store != nil {
 		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		storeErr := recordSendResult(storeCtx, store, *contextID, requestMessageID, *sender, *recipient, *source, res, err)
+		storeErr = recordSendResult(storeCtx, store, *contextID, requestMessageID, *sender, *recipient, *source, res, err)
 		storeCancel()
 		if storeErr != nil {
 			fmt.Fprintln(stderr, "send: store:", storeErr)
-			if err == nil {
-				return ExitStore
-			}
 		}
 	}
 	// TaskFailedError still carries an emittable payload; print first.
@@ -280,6 +274,9 @@ func runSend(args []string, stdout, stderr io.Writer, getenv func(string) string
 		fmt.Fprintln(stderr, "send:", err.Error())
 		return exitCode(err)
 	}
+	if storeErr != nil {
+		return ExitStore
+	}
 	return ExitOK
 }
 
@@ -291,6 +288,9 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	taskID := fs.String("task", "", "task ID to poll")
 	storePath := fs.String("store", "", "optional SQLite conversation store path")
 	conversationID := fs.String("conversation", "", "conversation ID used for durable wait events")
+	sender := fs.String("sender", "human", "durable transcript response recipient")
+	recipient := fs.String("recipient", "peer", "durable transcript response sender")
+	source := fs.String("source", "cli", "durable transcript source")
 	timeoutFlag := fs.String("timeout", "60s", "overall deadline (e.g. 60s, 5m)")
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
@@ -302,6 +302,10 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	}
 	if strings.TrimSpace(*taskID) == "" {
 		fmt.Fprintln(stderr, "wait: --task is required")
+		return ExitUsage
+	}
+	if (strings.TrimSpace(*storePath) == "") != (strings.TrimSpace(*conversationID) == "") {
+		fmt.Fprintln(stderr, "wait: --store and --conversation must be supplied together")
 		return ExitUsage
 	}
 	token, err := bearerFromEnv(*tokenEnv, getenv)
@@ -323,6 +327,7 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	client := a2a.NewClient(*urlFlag)
 	client.Tenant = strings.TrimSpace(*tenant)
 	task, raw, err := client.Wait(ctx, token, *taskID)
+	var storeErr error
 	if strings.TrimSpace(*storePath) != "" && strings.TrimSpace(*conversationID) != "" {
 		store, openErr := conversation.OpenSQLite(*storePath)
 		if openErr != nil {
@@ -332,19 +337,20 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 		defer store.Close()
 		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer storeCancel()
-		if ensureErr := store.EnsureConversation(storeCtx, conversation.Conversation{ID: *conversationID}); ensureErr != nil {
-			fmt.Fprintln(stderr, "wait: store:", ensureErr)
-			return ExitStore
-		}
 		payload, _ := json.Marshal(map[string]any{"taskId": *taskID, "state": func() string {
 			if task != nil {
 				return task.Status.State
 			}
 			return ""
 		}(), "error": safeError(err)})
-		if appendErr := store.AppendEvent(storeCtx, conversation.Event{ID: a2a.NewID(), ConversationID: *conversationID, Type: "wait_finished", CorrelationID: *conversationID, Payload: payload}); appendErr != nil {
-			fmt.Fprintln(stderr, "wait: store:", appendErr)
-			return ExitStore
+		var messages []conversation.Message
+		if task != nil && task.Status.Message != nil {
+			m := task.Status.Message
+			messages = append(messages, conversation.Message{ID: m.MessageID, ConversationID: *conversationID, Sender: *recipient, Recipient: *sender, Body: messageText(m), Source: *source, ContextID: m.ContextID, TaskID: task.ID})
+		}
+		storeErr = store.Record(storeCtx, conversation.Conversation{ID: *conversationID, Participants: []string{*sender, *recipient}}, messages, []conversation.Event{{ID: a2a.NewID(), ConversationID: *conversationID, Type: "wait_finished", CorrelationID: *conversationID, Payload: payload}})
+		if storeErr != nil {
+			fmt.Fprintln(stderr, "wait: store:", storeErr)
 		}
 	}
 	if task != nil && len(raw) > 0 {
@@ -356,6 +362,9 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	if err != nil {
 		fmt.Fprintln(stderr, "wait:", err.Error())
 		return exitCode(err)
+	}
+	if storeErr != nil {
+		return ExitStore
 	}
 	return ExitOK
 }
@@ -384,22 +393,21 @@ func recordSendResult(ctx context.Context, store conversation.Store, conversatio
 	if sendErr != nil {
 		typeName = "send_failed"
 	}
+	var messages []conversation.Message
 	if res != nil && res.Task != nil {
 		payload["taskId"] = res.Task.ID
 		payload["state"] = res.Task.Status.State
 		if res.Task.Status.Message != nil {
-			if err := store.AppendMessage(ctx, conversation.Message{ID: res.Task.Status.Message.MessageID, ConversationID: conversationID, ParentID: causationID, Sender: recipient, Recipient: sender, Body: messageText(res.Task.Status.Message), Source: source, ContextID: conversationID, TaskID: res.Task.ID}); err != nil {
-				return err
-			}
+			m := res.Task.Status.Message
+			messages = append(messages, conversation.Message{ID: m.MessageID, ConversationID: conversationID, ParentID: causationID, Sender: recipient, Recipient: sender, Body: messageText(m), Source: source, ContextID: m.ContextID, TaskID: res.Task.ID})
 		}
 	}
 	if res != nil && res.Message != nil {
-		if err := store.AppendMessage(ctx, conversation.Message{ID: res.Message.MessageID, ConversationID: conversationID, ParentID: causationID, Sender: recipient, Recipient: sender, Body: messageText(res.Message), Source: source, ContextID: conversationID, TaskID: res.Message.TaskID}); err != nil {
-			return err
-		}
+		m := res.Message
+		messages = append(messages, conversation.Message{ID: m.MessageID, ConversationID: conversationID, ParentID: causationID, Sender: recipient, Recipient: sender, Body: messageText(m), Source: source, ContextID: m.ContextID, TaskID: m.TaskID})
 	}
 	raw, _ := json.Marshal(payload)
-	return store.AppendEvent(ctx, conversation.Event{ID: a2a.NewID(), ConversationID: conversationID, Type: typeName, CausationID: causationID, CorrelationID: conversationID, Payload: raw})
+	return store.Record(ctx, conversation.Conversation{ID: conversationID, Participants: []string{sender, recipient}}, messages, []conversation.Event{{ID: a2a.NewID(), ConversationID: conversationID, Type: typeName, CausationID: causationID, CorrelationID: conversationID, Payload: raw}})
 }
 
 func openReadStore(path string, stderr io.Writer) (*conversation.SQLiteStore, int) {
@@ -407,7 +415,7 @@ func openReadStore(path string, stderr io.Writer) (*conversation.SQLiteStore, in
 		fmt.Fprintln(stderr, "--store is required")
 		return nil, ExitUsage
 	}
-	s, err := conversation.OpenSQLite(path)
+	s, err := conversation.OpenSQLiteReadOnly(path)
 	if err != nil {
 		fmt.Fprintln(stderr, "store:", err)
 		return nil, ExitStore

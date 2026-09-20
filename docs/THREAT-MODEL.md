@@ -1,8 +1,8 @@
 # Threat model — Slice 1 (`a2actl`)
 
-Scope: local A2A 1.0 discovery, one authenticated `message/send`, and
-`tasks/get` polling. No cluster mutation, no Telegram, no Temporal, no paste
-service.
+Scope: local A2A 1.0 discovery, authenticated `SendMessage`, `GetTask`
+polling, and optional local SQLite transcript storage. No cluster mutation,
+Telegram, Temporal, or shared paste service.
 
 ## Trust boundaries
 
@@ -50,10 +50,17 @@ service.
 6. **Failure isolation.** Terminal `failed`/`rejected`/`canceled` states exit
    4 with the payload on stdout and the reason on stderr; they never trigger
    retries, sidecars, or follow-up sends in this slice.
+7. **Local transcript boundary.** Related transcript rows and audit events are
+   committed in one transaction. The stored outbound ID is the exact wire
+   message ID. Credential-shaped fields are structurally redacted from JSON
+   and scrubbed from free text. New database files are mode `0600`; read
+   commands require an existing file. The CLI exposes no update/delete API.
 
 ## Residual risks (later slices)
 
-- No durable ordering/retries/HITL yet (Temporal slice owns that).
+- SQLite is searchable evidence, not a workflow engine or tamper-proof audit
+  ledger. A process with direct file access can rewrite it. There is no durable
+  ordering/retry/HITL controller yet (Temporal owns that later).
 - No server-side rate limits, loop guards, or cost budgets in this CLI; the
    gateway slice must enforce hop/turn/wall-time/concurrency bounds.
 - Kubernetes Secret plumbing, Service ports, and NetworkPolicy arrive in

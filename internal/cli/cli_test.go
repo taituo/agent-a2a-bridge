@@ -84,6 +84,13 @@ func TestWaitPersistsFinalMessageAndRequiresFlagPair(t *testing.T) {
 	}
 	out.Reset()
 	errBuf.Reset()
+	badStore := filepath.Join(t.TempDir(), "missing", "store.db")
+	code = Run([]string{"wait", "--url", srv.URL, "--token-env", "T", "--task", "task-1", "--store", badStore, "--conversation", "conversation-1"}, &out, &errBuf, getenvFor("T", testBearer))
+	if code != ExitStore || atomic.LoadInt64(&calls) != 0 {
+		t.Fatalf("invalid store was not rejected before network: code=%d calls=%d", code, calls)
+	}
+	out.Reset()
+	errBuf.Reset()
 	code = Run([]string{"wait", "--url", srv.URL, "--token-env", "T", "--task", "task-1", "--store", db, "--conversation", "conversation-1", "--sender", "tuomas", "--recipient", "hura"}, &out, &errBuf, getenvFor("T", testBearer))
 	if code != ExitOK {
 		t.Fatalf("wait got %d: %s", code, errBuf.String())

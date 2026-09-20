@@ -23,6 +23,9 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("sqlite path is required")
 	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(path)), "file:") {
+		return nil, errors.New("sqlite URI paths are not supported; use a filesystem path")
+	}
 	if err := secureCreate(path); err != nil {
 		return nil, err
 	}
@@ -69,7 +72,7 @@ func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
 }
 
 func secureCreate(path string) error {
-	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+	if path == ":memory:" {
 		return nil
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)

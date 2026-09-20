@@ -67,6 +67,12 @@ func TestSQLiteFileIsPrivateAndReadOnlyOpenDoesNotCreate(t *testing.T) {
 	defer r.Close()
 }
 
+func TestSQLiteURIIsRejected(t *testing.T) {
+	if _, err := OpenSQLite("file:" + filepath.Join(t.TempDir(), "unsafe.db")); err == nil {
+		t.Fatal("URI path bypassed secure creation")
+	}
+}
+
 func TestRecordRollsBackAsOneUnit(t *testing.T) {
 	s, err := OpenSQLite(filepath.Join(t.TempDir(), "atomic.db"))
 	if err != nil {

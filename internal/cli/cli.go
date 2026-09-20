@@ -323,18 +323,21 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	var store conversation.Store
+	if strings.TrimSpace(*storePath) != "" {
+		store, err = conversation.OpenSQLite(*storePath)
+		if err != nil {
+			fmt.Fprintln(stderr, "wait: store:", err)
+			return ExitStore
+		}
+		defer store.Close()
+	}
 
 	client := a2a.NewClient(*urlFlag)
 	client.Tenant = strings.TrimSpace(*tenant)
 	task, raw, err := client.Wait(ctx, token, *taskID)
 	var storeErr error
-	if strings.TrimSpace(*storePath) != "" && strings.TrimSpace(*conversationID) != "" {
-		store, openErr := conversation.OpenSQLite(*storePath)
-		if openErr != nil {
-			fmt.Fprintln(stderr, "wait: store:", openErr)
-			return ExitStore
-		}
-		defer store.Close()
+	if store != nil {
 		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer storeCancel()
 		payload, _ := json.Marshal(map[string]any{"taskId": *taskID, "state": func() string {

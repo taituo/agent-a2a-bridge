@@ -28,9 +28,11 @@ const (
 	// DefaultTimeout bounds any single HTTP call when the caller has no deadline.
 	DefaultTimeout = 15 * time.Second
 	// DefaultPollInterval is the initial wait delay; it doubles up to MaxPollInterval.
-	DefaultPollInterval = 200 * time.Millisecond
+	// One second keeps a long-running wait below common peer rate limits while
+	// still returning promptly for interactive tasks.
+	DefaultPollInterval = 1 * time.Second
 	// DefaultMaxPollInterval caps the bounded backoff.
-	DefaultMaxPollInterval = 2 * time.Second
+	DefaultMaxPollInterval = 5 * time.Second
 )
 
 // Client is an A2A 1.0 JSON-RPC client. BaseURL is the agent endpoint

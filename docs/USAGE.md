@@ -24,13 +24,11 @@ a2actl wait --url URL --token-env ENV_NAME --task ID [--tenant T] [--timeout 60s
   `send`/`wait` `--url` is the JSON-RPC endpoint (the selected
   `supportedInterfaces[].url` from the Agent Card, e.g. `http://host:9900`
   or `http://host:18789/a2a/v1`).
-- Agent Cards follow A2A 1.0. Validation is a **narrow operational subset**:
-  `discover` requires `name`, `version`, and a `supportedInterfaces` entry
-  with `protocolBinding: "JSONRPC"` and `protocolVersion: "1.0"`, then prints
-  that interface's `url`, `protocolBinding`, `protocolVersion`, and `tenant`.
-  It deliberately does not require the other fields the 1.0 schema marks
-  required (`description`, `capabilities`, `defaultInputModes`,
-  `defaultOutputModes`, `skills`).
+- Agent Cards follow A2A 1.0. `discover` requires the schema's required
+  identity, capability, media-mode and skill declarations plus a
+  `supportedInterfaces` entry with `protocolBinding: "JSONRPC"` and
+  `protocolVersion: "1.0"`. It prints the selected interface's `url`,
+  `protocolBinding`, `protocolVersion`, and `tenant`.
 - If the selected interface declares a `tenant`, A2A 1.0 requires it on every
   request. Pass `--tenant T` to `send`/`wait` (the value printed by
   `discover`); it is sent in the request `params` and omitted when empty.

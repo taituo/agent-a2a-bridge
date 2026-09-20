@@ -1,7 +1,7 @@
 # a2actl usage
 
 `a2actl` is a minimal A2A 1.0 client for Slice 1. It discovers an Agent Card,
-sends one message, and polls one task. Standard library only.
+sends one message, polls one task, and optionally stores a queryable transcript.
 
 Build:
 
@@ -15,6 +15,9 @@ go build -o bin/a2actl ./cmd/a2actl
 a2actl discover --url URL [--timeout 15s]
 a2actl send --url URL --token-env ENV_NAME --message TEXT [--context ID] [--tenant T] [--timeout 30s]
 a2actl wait --url URL --token-env ENV_NAME --task ID [--tenant T] [--timeout 60s]
+a2actl conversations --store DB [--limit 100]
+a2actl messages --store DB --conversation ID [--limit 100]
+a2actl events --store DB --conversation ID [--limit 100]
 ```
 
 - `--url` for `discover` may be a base URL or an endpoint URL; the client
@@ -47,6 +50,21 @@ a2actl wait --url URL --token-env ENV_NAME --task ID [--tenant T] [--timeout 60s
   returns a task ID immediately for `wait` to poll.
 - Output is stable indented JSON on stdout; errors go to stderr.
 
+## Durable transcript
+
+Add `--store PATH`, `--sender NAME`, `--recipient NAME`, and optionally
+`--source telegram|voice|cli|temporal` to `send`. If `--context` is omitted,
+the CLI creates one and uses it as both the A2A context and durable
+conversation ID. Add `--store PATH --conversation ID` to `wait` to record its
+terminal state.
+
+The schema separates conversations, immutable messages, and immutable audit
+events. There are intentionally no update or delete commands. Duplicate IDs
+fail instead of overwriting prior history. Common credential shapes are
+redacted before persistence, but callers must still avoid placing secrets in
+prompts. SQLite is an initial local implementation behind a Store interface;
+it can later be replaced by PostgreSQL without changing A2A routing.
+
 Examples (synthetic values only):
 
 ```sh
@@ -69,6 +87,7 @@ A2A_TOKEN=hura-to-koura-synthetic a2actl wait \
 | 3 | Protocol (version mismatch, bad content type, malformed envelope, missing fields, response-ID mismatch). |
 | 4 | Remote terminal task failure (`TASK_STATE_FAILED`, `TASK_STATE_REJECTED`, or `TASK_STATE_CANCELED`; payload still printed). |
 | 5 | Transport/timeout (network error, deadline exceeded, oversized body). |
+| 6 | Durable conversation store failure. |
 
 `send` prints `{"type":"task","task":{...}}` or
 `{"type":"message","message":{...}}` using the peer's raw object so unknown

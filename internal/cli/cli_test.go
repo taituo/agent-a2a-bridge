@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,36 @@ func getenvFor(env, val string) func(string) string {
 			return val
 		}
 		return ""
+	}
+}
+
+func TestSendPersistsQueryableConversation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(rpcEnvelope(decodeID(r), `{"message":{"role":"ROLE_AGENT","messageId":"reply-1","contextId":"conversation-1","parts":[{"text":"token=server-secret must be hidden"}]}}`)))
+	}))
+	defer srv.Close()
+	db := filepath.Join(t.TempDir(), "conversations.db")
+	var out, errBuf bytes.Buffer
+	code := Run([]string{"send", "--url", srv.URL, "--token-env", "T", "--message", "hello", "--context", "conversation-1", "--sender", "tuomas", "--recipient", "hura", "--store", db}, &out, &errBuf, getenvFor("T", testBearer))
+	if code != ExitOK {
+		t.Fatalf("send got %d: %s", code, errBuf.String())
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = Run([]string{"messages", "--store", db, "--conversation", "conversation-1"}, &out, &errBuf, nil)
+	if code != ExitOK {
+		t.Fatalf("messages got %d: %s", code, errBuf.String())
+	}
+	var messages []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &messages); err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("got %d messages: %s", len(messages), out.String())
+	}
+	if strings.Contains(out.String(), "server-secret") || !strings.Contains(out.String(), "[REDACTED]") {
+		t.Fatalf("stored response not redacted: %s", out.String())
 	}
 }
 

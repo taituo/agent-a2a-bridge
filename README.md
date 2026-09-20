@@ -3,13 +3,14 @@
 `agent-a2a-bridge` is a small, strict A2A 1.0 client and interoperability
 toolkit for connecting independently operated AI agents.
 
-It currently provides a dependency-free Go library and the `a2actl` CLI for:
+It currently provides a Go library and the `a2actl` CLI for:
 
 - discovering an agent through its standard Agent Card;
 - validating required A2A 1.0 fields and JSON-RPC envelopes;
 - sending authenticated `SendMessage` requests;
 - polling asynchronous work with `GetTask`;
 - continuing a conversation with a stable context ID;
+- optionally recording an append-only transcript and audit trail in SQLite;
 - distinguishing authentication, protocol, remote-task and transport errors;
 - keeping credentials out of command-line arguments and output.
 
@@ -52,7 +53,8 @@ go build -o bin/a2actl ./cmd/a2actl
 make check
 ```
 
-The runtime client uses only the Go standard library.
+The A2A transport uses the Go standard library. Optional durable conversation
+storage uses the pure-Go `modernc.org/sqlite` driver.
 
 ## Quick start
 
@@ -66,14 +68,22 @@ bin/a2actl send \
   --url http://localhost:18789/a2a/v1 \
   --token-env PEER_TOKEN \
   --message 'Review this proposal' \
-  --context review-42
+  --context review-42 \
+  --sender human --recipient reviewer \
+  --store ./conversations.db
 
 # Poll a returned task ID to completion.
 bin/a2actl wait \
   --url http://localhost:18789/a2a/v1 \
   --token-env PEER_TOKEN \
   --task TASK_ID \
+  --conversation review-42 \
+  --store ./conversations.db \
   --timeout 2m
+
+# Query the immutable transcript and audit events.
+bin/a2actl messages --store ./conversations.db --conversation review-42
+bin/a2actl events --store ./conversations.db --conversation review-42
 ```
 
 Reuse `--context` for later turns in the same conversation. If discovery
@@ -83,8 +93,11 @@ reports a tenant, pass it with `--tenant` on `send` and `wait`.
 
 ```text
 a2actl discover --url URL [--timeout 15s]
-a2actl send --url URL --token-env ENV --message TEXT [--context ID] [--tenant T]
-a2actl wait --url URL --token-env ENV --task ID [--tenant T] [--timeout 60s]
+a2actl send --url URL --token-env ENV --message TEXT [--context ID] [--tenant T] [--store DB]
+a2actl wait --url URL --token-env ENV --task ID [--tenant T] [--timeout 60s] [--store DB --conversation ID]
+a2actl conversations --store DB [--limit N]
+a2actl messages --store DB --conversation ID [--limit N]
+a2actl events --store DB --conversation ID [--limit N]
 ```
 
 Successful output is stable indented JSON. Diagnostics go to stderr.
@@ -97,6 +110,7 @@ Successful output is stable indented JSON. Diagnostics go to stderr.
 | 3 | Protocol or schema failure |
 | 4 | Remote task failed, was rejected or was canceled |
 | 5 | Transport error, timeout or oversized response |
+| 6 | Conversation store error |
 
 See [`docs/USAGE.md`](docs/USAGE.md) for complete CLI behavior.
 
@@ -111,6 +125,9 @@ See [`docs/USAGE.md`](docs/USAGE.md) for complete CLI behavior.
 - Context-aware HTTP requests with deadlines and bounded bodies.
 - Polling backoff designed not to trip common peer rate limits.
 - Bearer values are accepted only through named environment variables.
+- Transcript rows and audit events are append-only through the public API.
+- Common bearer, token, API-key, password and Telegram-token shapes are
+  redacted before persistence.
 - Tests use synthetic credentials and local `httptest` servers only.
 
 See [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md).

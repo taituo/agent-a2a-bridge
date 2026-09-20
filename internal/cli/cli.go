@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-a2a-bridge/internal/a2a"
+	"github.com/agent-a2a-bridge/internal/conversation"
 )
 
 const (
@@ -26,6 +27,8 @@ const (
 	ExitTaskFailed = 4
 	// ExitTransport covers network errors, deadlines, and oversized bodies.
 	ExitTransport = 5
+	// ExitStore covers durable transcript failures.
+	ExitStore = 6
 )
 
 // exitCode maps typed library errors to stable exit codes.
@@ -63,7 +66,7 @@ func exitCode(err error) int {
 // tokens are never printed.
 func Run(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: a2actl <discover|send|wait> [flags]")
+		fmt.Fprintln(stderr, "usage: a2actl <discover|send|wait|conversations|messages|events> [flags]")
 		return ExitUsage
 	}
 	switch args[0] {
@@ -73,8 +76,14 @@ func Run(args []string, stdout, stderr io.Writer, getenv func(string) string) in
 		return runSend(args[1:], stdout, stderr, getenv)
 	case "wait":
 		return runWait(args[1:], stdout, stderr, getenv)
+	case "conversations":
+		return runConversations(args[1:], stdout, stderr)
+	case "messages":
+		return runMessages(args[1:], stdout, stderr)
+	case "events":
+		return runEvents(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown command %q (want discover|send|wait)\n", args[0])
+		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return ExitUsage
 	}
 }
@@ -180,6 +189,10 @@ func runSend(args []string, stdout, stderr io.Writer, getenv func(string) string
 	tenant := fs.String("tenant", "", "optional tenant from the selected agent card interface")
 	message := fs.String("message", "", "message text to send")
 	contextID := fs.String("context", "", "optional A2A context ID (generated when empty)")
+	storePath := fs.String("store", "", "optional SQLite conversation store path")
+	sender := fs.String("sender", "human", "durable transcript sender identity")
+	recipient := fs.String("recipient", "peer", "durable transcript recipient identity")
+	source := fs.String("source", "cli", "durable transcript source")
 	timeoutFlag := fs.String("timeout", "30s", "overall deadline (e.g. 30s, 1m)")
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
@@ -208,10 +221,48 @@ func runSend(args []string, stdout, stderr io.Writer, getenv func(string) string
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	if strings.TrimSpace(*contextID) == "" {
+		*contextID = a2a.NewID()
+	}
+	var store conversation.Store
+	requestMessageID := a2a.NewID()
+	if strings.TrimSpace(*storePath) != "" {
+		store, err = conversation.OpenSQLite(*storePath)
+		if err != nil {
+			fmt.Fprintln(stderr, "send: store:", err)
+			return ExitStore
+		}
+		defer store.Close()
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer storeCancel()
+		if err := store.EnsureConversation(storeCtx, conversation.Conversation{ID: *contextID, Participants: []string{*sender, *recipient}}); err != nil {
+			fmt.Fprintln(stderr, "send: store:", err)
+			return ExitStore
+		}
+		if err := store.AppendMessage(storeCtx, conversation.Message{ID: requestMessageID, ConversationID: *contextID, Sender: *sender, Recipient: *recipient, Body: *message, Source: *source, ContextID: *contextID}); err != nil {
+			fmt.Fprintln(stderr, "send: store:", err)
+			return ExitStore
+		}
+		if err := store.AppendEvent(storeCtx, conversation.Event{ID: a2a.NewID(), ConversationID: *contextID, Type: "send_started", CausationID: requestMessageID, CorrelationID: *contextID}); err != nil {
+			fmt.Fprintln(stderr, "send: store:", err)
+			return ExitStore
+		}
+	}
 
 	client := a2a.NewClient(*urlFlag)
 	client.Tenant = strings.TrimSpace(*tenant)
 	res, err := client.SendMessage(ctx, token, *message, *contextID)
+	if store != nil {
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		storeErr := recordSendResult(storeCtx, store, *contextID, requestMessageID, *sender, *recipient, *source, res, err)
+		storeCancel()
+		if storeErr != nil {
+			fmt.Fprintln(stderr, "send: store:", storeErr)
+			if err == nil {
+				return ExitStore
+			}
+		}
+	}
 	// TaskFailedError still carries an emittable payload; print first.
 	if res != nil {
 		var payload any
@@ -238,6 +289,8 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	tokenEnv := fs.String("token-env", "", "environment variable holding the bearer token")
 	tenant := fs.String("tenant", "", "optional tenant from the selected agent card interface")
 	taskID := fs.String("task", "", "task ID to poll")
+	storePath := fs.String("store", "", "optional SQLite conversation store path")
+	conversationID := fs.String("conversation", "", "conversation ID used for durable wait events")
 	timeoutFlag := fs.String("timeout", "60s", "overall deadline (e.g. 60s, 5m)")
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
@@ -270,6 +323,30 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	client := a2a.NewClient(*urlFlag)
 	client.Tenant = strings.TrimSpace(*tenant)
 	task, raw, err := client.Wait(ctx, token, *taskID)
+	if strings.TrimSpace(*storePath) != "" && strings.TrimSpace(*conversationID) != "" {
+		store, openErr := conversation.OpenSQLite(*storePath)
+		if openErr != nil {
+			fmt.Fprintln(stderr, "wait: store:", openErr)
+			return ExitStore
+		}
+		defer store.Close()
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer storeCancel()
+		if ensureErr := store.EnsureConversation(storeCtx, conversation.Conversation{ID: *conversationID}); ensureErr != nil {
+			fmt.Fprintln(stderr, "wait: store:", ensureErr)
+			return ExitStore
+		}
+		payload, _ := json.Marshal(map[string]any{"taskId": *taskID, "state": func() string {
+			if task != nil {
+				return task.Status.State
+			}
+			return ""
+		}(), "error": safeError(err)})
+		if appendErr := store.AppendEvent(storeCtx, conversation.Event{ID: a2a.NewID(), ConversationID: *conversationID, Type: "wait_finished", CorrelationID: *conversationID, Payload: payload}); appendErr != nil {
+			fmt.Fprintln(stderr, "wait: store:", appendErr)
+			return ExitStore
+		}
+	}
 	if task != nil && len(raw) > 0 {
 		if werr := emitJSON(stdout, map[string]any{"task": json.RawMessage(raw)}); werr != nil {
 			fmt.Fprintln(stderr, "wait:", werr.Error())
@@ -279,6 +356,138 @@ func runWait(args []string, stdout, stderr io.Writer, getenv func(string) string
 	if err != nil {
 		fmt.Fprintln(stderr, "wait:", err.Error())
 		return exitCode(err)
+	}
+	return ExitOK
+}
+
+func safeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return conversation.Redact(err.Error())
+}
+
+func messageText(m *a2a.Message) string {
+	if m == nil {
+		return ""
+	}
+	var parts []string
+	for _, p := range m.Parts {
+		parts = append(parts, p.Text)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func recordSendResult(ctx context.Context, store conversation.Store, conversationID, causationID, sender, recipient, source string, res *a2a.SendResult, sendErr error) error {
+	typeName := "send_completed"
+	payload := map[string]any{"error": safeError(sendErr)}
+	if sendErr != nil {
+		typeName = "send_failed"
+	}
+	if res != nil && res.Task != nil {
+		payload["taskId"] = res.Task.ID
+		payload["state"] = res.Task.Status.State
+		if res.Task.Status.Message != nil {
+			if err := store.AppendMessage(ctx, conversation.Message{ID: res.Task.Status.Message.MessageID, ConversationID: conversationID, ParentID: causationID, Sender: recipient, Recipient: sender, Body: messageText(res.Task.Status.Message), Source: source, ContextID: conversationID, TaskID: res.Task.ID}); err != nil {
+				return err
+			}
+		}
+	}
+	if res != nil && res.Message != nil {
+		if err := store.AppendMessage(ctx, conversation.Message{ID: res.Message.MessageID, ConversationID: conversationID, ParentID: causationID, Sender: recipient, Recipient: sender, Body: messageText(res.Message), Source: source, ContextID: conversationID, TaskID: res.Message.TaskID}); err != nil {
+			return err
+		}
+	}
+	raw, _ := json.Marshal(payload)
+	return store.AppendEvent(ctx, conversation.Event{ID: a2a.NewID(), ConversationID: conversationID, Type: typeName, CausationID: causationID, CorrelationID: conversationID, Payload: raw})
+}
+
+func openReadStore(path string, stderr io.Writer) (*conversation.SQLiteStore, int) {
+	if strings.TrimSpace(path) == "" {
+		fmt.Fprintln(stderr, "--store is required")
+		return nil, ExitUsage
+	}
+	s, err := conversation.OpenSQLite(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "store:", err)
+		return nil, ExitStore
+	}
+	return s, ExitOK
+}
+
+func readFlags(name string, args []string, stderr io.Writer, needConversation bool) (string, string, int, int) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	path := fs.String("store", "", "SQLite conversation store path")
+	id := fs.String("conversation", "", "conversation ID")
+	limit := fs.Int("limit", 100, "maximum rows (1-1000)")
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return "", "", 0, ExitUsage
+	}
+	if needConversation && strings.TrimSpace(*id) == "" {
+		fmt.Fprintln(stderr, name+": --conversation is required")
+		return "", "", 0, ExitUsage
+	}
+	return *path, *id, *limit, ExitOK
+}
+
+func runConversations(args []string, stdout, stderr io.Writer) int {
+	path, _, limit, code := readFlags("conversations", args, stderr, false)
+	if code != 0 {
+		return code
+	}
+	s, code := openReadStore(path, stderr)
+	if code != 0 {
+		return code
+	}
+	defer s.Close()
+	rows, err := s.ListConversations(context.Background(), limit)
+	if err != nil {
+		fmt.Fprintln(stderr, "conversations:", err)
+		return ExitStore
+	}
+	if err := emitJSON(stdout, rows); err != nil {
+		return ExitStore
+	}
+	return ExitOK
+}
+func runMessages(args []string, stdout, stderr io.Writer) int {
+	path, id, limit, code := readFlags("messages", args, stderr, true)
+	if code != 0 {
+		return code
+	}
+	s, code := openReadStore(path, stderr)
+	if code != 0 {
+		return code
+	}
+	defer s.Close()
+	rows, err := s.ListMessages(context.Background(), id, limit)
+	if err != nil {
+		fmt.Fprintln(stderr, "messages:", err)
+		return ExitStore
+	}
+	if err := emitJSON(stdout, rows); err != nil {
+		return ExitStore
+	}
+	return ExitOK
+}
+func runEvents(args []string, stdout, stderr io.Writer) int {
+	path, id, limit, code := readFlags("events", args, stderr, true)
+	if code != 0 {
+		return code
+	}
+	s, code := openReadStore(path, stderr)
+	if code != 0 {
+		return code
+	}
+	defer s.Close()
+	rows, err := s.ListEvents(context.Background(), id, limit)
+	if err != nil {
+		fmt.Fprintln(stderr, "events:", err)
+		return ExitStore
+	}
+	if err := emitJSON(stdout, rows); err != nil {
+		return ExitStore
 	}
 	return ExitOK
 }

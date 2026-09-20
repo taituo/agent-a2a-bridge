@@ -91,6 +91,11 @@ not `UPDATE` or `DELETE`. Records retain author identity, scope, timestamp,
 content hash, references, and optional expiry. Writing a paste never wakes or
 messages another agent.
 
+An initial local conversation store now exists as a separate concern: SQLite
+records immutable conversations, messages, and transport events. It is not the
+shared bulletin board and writing to it never wakes a peer. The Store interface
+is the migration boundary for PostgreSQL and later Temporal integration.
+
 ### Slice 5 — shared human room
 
 Route `Hura`, `Koura`, and `both` from a Telegram group. For `both`, a deterministic
@@ -103,4 +108,3 @@ One workflow execution owns each conversation. Telegram messages become
 Signals or Updates; A2A calls are Activities; task IDs and compact metadata are
 stored in history while full transcripts/artifacts live in durable storage.
 The workflow enforces ordering, retries, timeouts, budgets, max turns, and HITL.
-

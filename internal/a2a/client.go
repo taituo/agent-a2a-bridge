@@ -114,6 +114,10 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// NewID returns a cryptographically random identifier suitable for A2A
+// context, message, correlation, and local audit identifiers.
+func NewID() string { return newID() }
+
 // checkVersionHeader rejects a response that explicitly declares a
 // non-1.0 A2A version. A missing header is accepted.
 func checkVersionHeader(h http.Header) error {
